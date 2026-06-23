@@ -1,0 +1,89 @@
+# Seven services: three read-only MCP servers, two write MCP servers, and the
+# two A2A agents. A shared volume gives the MCP servers a common "cluster" so
+# the Operator's restart is visible to the Observer's re-read.
+#
+# The local LLM is expected on the host (Ollama / llama-server). Containers
+# reach it via host.docker.internal (see extra_hosts). Override LLM_* in .env.
+
+x-llm-env: &llm-env
+  LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+  LLM_MODEL: ${LLM_MODEL:-gemma3:27b}
+  LLM_API_KEY: ${LLM_API_KEY:-local}
+
+x-demo-env: &demo-env
+  DEMO_MODE: ${DEMO_MODE:-1}
+  DEMO_STATE_FILE: /data/cluster_state.json
+
+x-host: &host-gateway
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  # ---- read-only MCP servers (Observer's tools) ----
+  k8s-ro:
+    build: .
+    command: python -m mcp_servers.k8s_readonly
+    environment: { <<: *demo-env, PORT: "8101" }
+    volumes: [ "cluster-state:/data" ]
+
+  pg-alerts:
+    build: .
+    command: python -m mcp_servers.pg_alerts
+    environment: { <<: *demo-env, PORT: "8102" }
+    volumes: [ "cluster-state:/data" ]
+
+  es-logs:
+    build: .
+    command: python -m mcp_servers.es_logs
+    environment: { <<: *demo-env, PORT: "8103" }
+    volumes: [ "cluster-state:/data" ]
+
+  # ---- write MCP servers (Operator's tools) ----
+  k8s-write:
+    build: .
+    command: python -m mcp_servers.k8s_write
+    environment:
+      <<: *demo-env
+      PORT: "8201"
+      ALLOWED_NAMESPACES: ${ALLOWED_NAMESPACES:-web,payments,staging}
+      MAX_REPLICAS: ${MAX_REPLICAS:-20}
+    volumes: [ "cluster-state:/data" ]
+
+  shell-exec:
+    build: .
+    command: python -m mcp_servers.shell_exec
+    environment: { <<: *demo-env, PORT: "8202" }
+    volumes: [ "cluster-state:/data" ]
+
+  # ---- agents ----
+  operator:
+    build: .
+    command: python -m agents.operator.server
+    <<: *host-gateway
+    environment:
+      <<: [ *llm-env, *demo-env ]
+      PORT: "9301"
+      OPERATOR_PUBLIC_URL: http://operator:9301
+      K8S_WRITE_URL: http://k8s-write:8201/mcp
+      SHELL_URL: http://shell-exec:8202/mcp
+      REQUIRE_APPROVAL: ${REQUIRE_APPROVAL:-0}
+    ports: [ "9301:9301" ]
+    depends_on: [ k8s-write, shell-exec ]
+
+  observer:
+    build: .
+    command: python -m agents.observer.server
+    <<: *host-gateway
+    environment:
+      <<: [ *llm-env, *demo-env ]
+      PORT: "9300"
+      OBSERVER_PUBLIC_URL: http://observer:9300
+      OPERATOR_URL: http://operator:9301
+      K8S_RO_URL: http://k8s-ro:8101/mcp
+      PG_ALERTS_URL: http://pg-alerts:8102/mcp
+      ES_LOGS_URL: http://es-logs:8103/mcp
+    ports: [ "9300:9300" ]
+    depends_on: [ k8s-ro, pg-alerts, es-logs, operator ]
+
+volumes:
+  cluster-state:
