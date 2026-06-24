@@ -3,8 +3,8 @@
 Two SRE agents that split investigation from action across a **privilege
 boundary**:
 
-- **Observer** (read-only) investigates an incident using Kubernetes, a
-  Postgres alerting service, and Elasticsearch logs. It has **no write tools**.
+- **Observer** (read-only) investigates an incident using Kubernetes,
+  Prometheus alerts, and Elasticsearch logs. It has **no write tools**.
 - **Operator** (write) executes remediation on Kubernetes and hosts, behind a
   **policy harness**.
 
@@ -19,7 +19,7 @@ split into a real process/network boundary, not a convention.
  (read-only)                          (write + harness)
    │ MCP                                  │ MCP
    ▼                                      ▼
- K8s(read) · PG alerts · ES logs   K8s(write) · Shell exec
+ K8s(read) · Prometheus alerts · ES logs   K8s(write) · Shell exec
 ```
 
 Each agent is a **LangGraph** ReAct agent driven by a **local, OpenAI-compatible
@@ -33,7 +33,7 @@ loaded via `langchain-mcp-adapters`. Agent-to-agent communication uses the
 | Path | Role |
 |---|---|
 | `mcp_servers/k8s_readonly.py` | read pods, logs, warning events |
-| `mcp_servers/pg_alerts.py` | active alerts, DB health (read-only role) |
+| `mcp_servers/prometheus_alerts.py` | active alerts, PromQL metric query |
 | `mcp_servers/es_logs.py` | search recent logs |
 | `mcp_servers/k8s_write.py` | restart/scale deployments — **harness: namespace allowlist + replica cap** |
 | `mcp_servers/shell_exec.py` | run host commands — **harness: binary allowlist + pattern denylist + verb limits** |
@@ -96,7 +96,7 @@ In four terminals (or use `&`), with the venv active and `.env` exported:
 
 ```bash
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.k8s_readonly   # :8101
-DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.pg_alerts      # :8102
+DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.prometheus_alerts  # :8102
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.es_logs        # :8103
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.k8s_write      # :8201
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.shell_exec     # :8202
@@ -131,8 +131,8 @@ pip install ".[real]"
 ```
 
 Then provide credentials/config the real code paths expect: a kubeconfig or
-in-cluster service account (`kubernetes`), `PG_DSN` for a **read-only** role
-(`pg_alerts`), and `ES_URL` (`es_logs`). Keep the Operator's service account
+in-cluster service account (`kubernetes`), `ALERTMANAGER_URL` and `PROMETHEUS_URL`
+(`prometheus_alerts`), and `ES_URL` (`es_logs`). Keep the Operator's service account
 RBAC-scoped to exactly the verbs/namespaces its harness allows — the harness is
 your second line, RBAC is your first.
 

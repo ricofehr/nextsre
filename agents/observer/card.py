@@ -9,7 +9,7 @@ def observer_card() -> AgentCard:
     return AgentCard(
         name="SRE Observer",
         description="Read-only SRE agent. Investigates incidents across Kubernetes, "
-        "Postgres alerts and Elasticsearch logs, then delegates any fix.",
+        "Prometheus alerts and Elasticsearch logs, then delegates any fix.",
         version="1.0.0",
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],

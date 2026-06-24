@@ -26,9 +26,9 @@ services:
     environment: { <<: *demo-env, PORT: "8101" }
     volumes: [ "cluster-state:/data" ]
 
-  pg-alerts:
+  prometheus-alerts:
     build: .
-    command: python -m mcp_servers.pg_alerts
+    command: python -m mcp_servers.prometheus_alerts
     environment: { <<: *demo-env, PORT: "8102" }
     volumes: [ "cluster-state:/data" ]
 
@@ -80,10 +80,10 @@ services:
       OBSERVER_PUBLIC_URL: http://observer:9300
       OPERATOR_URL: http://operator:9301
       K8S_RO_URL: http://k8s-ro:8101/mcp
-      PG_ALERTS_URL: http://pg-alerts:8102/mcp
+      PROMETHEUS_ALERTS_URL: http://prometheus-alerts:8102/mcp
       ES_LOGS_URL: http://es-logs:8103/mcp
     ports: [ "9300:9300" ]
-    depends_on: [ k8s-ro, pg-alerts, es-logs, operator ]
+    depends_on: [ k8s-ro, prometheus-alerts, es-logs, operator ]
 
 volumes:
   cluster-state:

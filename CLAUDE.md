@@ -46,7 +46,7 @@ Five independent HTTP MCP servers provide all tools. Agents load tools dynamical
 | Server | Port | Access |
 |---|---|---|
 | `k8s_readonly.py` | 8101 | Observer |
-| `pg_alerts.py` | 8102 | Observer |
+| `prometheus_alerts.py` | 8102 | Observer |
 | `es_logs.py` | 8103 | Observer |
 | `k8s_write.py` | 8201 | Operator |
 | `shell_exec.py` | 8202 | Operator |

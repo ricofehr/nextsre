@@ -4,7 +4,7 @@ In DEMO mode every MCP server reads/writes the same JSON file (mounted on a
 shared volume in docker-compose). That lets the *read* servers report a live
 incident and the *write* server actually resolve it, so the Observer can
 verify recovery after delegating to the Operator - a full closed loop with
-no real Kubernetes/Postgres/Elasticsearch required.
+no real Kubernetes/Prometheus/Elasticsearch required.
 
 This is intentionally simple (atomic replace, last-write-wins). It is a demo
 substrate, not a datastore.
@@ -66,12 +66,6 @@ def _seed() -> dict:
                 "state": "firing",
             },
         ],
-        "db_health": {
-            "connections_used": 184,
-            "connections_max": 200,
-            "replication_lag_s": 0.4,
-            "slow_queries_1m": 12,
-        },
     }
 
 

@@ -21,7 +21,7 @@ os.environ["DEMO_MODE"] = "1"
 
 
 def test_read_tools_and_state() -> None:
-    from mcp_servers import demo_state, es_logs, k8s_readonly, pg_alerts
+    from mcp_servers import demo_state, es_logs, k8s_readonly, prometheus_alerts
 
     demo_state.reset()
 
@@ -29,7 +29,7 @@ def test_read_tools_and_state() -> None:
     assert pods and all(p["phase"] == "CrashLoopBackOff" for p in pods), pods
     logs = k8s_readonly.get_pod_logs("payments-api-00", "payments")
     assert "OOMKilled" in logs
-    alerts = pg_alerts.active_alerts("warning")
+    alerts = prometheus_alerts.active_alerts("warning")
     assert any(a["severity"] == "critical" for a in alerts)
     docs = es_logs.search_logs("error", service="payments-api")
     assert any(d["level"] == "ERROR" for d in docs)

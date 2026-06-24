@@ -14,22 +14,22 @@ from agents.observer.remediation_tool import request_remediation
 from common.llm import local_llm
 
 K8S_RO_URL = os.environ.get("K8S_RO_URL", "http://localhost:8101/mcp")
-PG_ALERTS_URL = os.environ.get("PG_ALERTS_URL", "http://localhost:8102/mcp")
+PROMETHEUS_ALERTS_URL = os.environ.get("PROMETHEUS_ALERTS_URL", "http://localhost:8102/mcp")
 ES_LOGS_URL = os.environ.get("ES_LOGS_URL", "http://localhost:8103/mcp")
 
 _mcp = MultiServerMCPClient(
     {
         "k8s_ro": {"transport": "streamable_http", "url": K8S_RO_URL},
-        "pg_alerts": {"transport": "streamable_http", "url": PG_ALERTS_URL},
+        "prometheus_alerts": {"transport": "streamable_http", "url": PROMETHEUS_ALERTS_URL},
         "es_logs": {"transport": "streamable_http", "url": ES_LOGS_URL},
     }
 )
 
 SYSTEM = """You are an SRE observability agent. You can ONLY read - cluster
-state, database alerts, and logs. Investigate the reported incident:
+state, Prometheus alerts, and logs. Investigate the reported incident:
 
-1. Gather evidence: list pods and warning events, check active DB alerts and
-   DB health, and search recent logs for the affected service.
+1. Gather evidence: list pods and warning events, check active Prometheus alerts
+   and query relevant metrics, and search recent logs for the affected service.
 2. State a concise root-cause hypothesis backed by that evidence.
 3. Decide the single least-risky remediation.
 

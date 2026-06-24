@@ -4,7 +4,7 @@
 
 ## Big Picture
 
-NextSRE is a multi-agent incident-response system built on a deliberate privilege split. A **read-only Observer** investigates a reported incident by gathering evidence from Kubernetes, Postgres alerts, and Elasticsearch, then decides whether a remediation is warranted. If it is, the Observer hands a single, precise instruction to a **write-capable Operator** over the **A2A (Agent-to-Agent) protocol**. The Operator re-evaluates that instruction against its own policy harness and executes it if safe.
+NextSRE is a multi-agent incident-response system built on a deliberate privilege split. A **read-only Observer** investigates a reported incident by gathering evidence from Kubernetes, Prometheus alerts, and Elasticsearch, then decides whether a remediation is warranted. If it is, the Observer hands a single, precise instruction to a **write-capable Operator** over the **A2A (Agent-to-Agent) protocol**. The Operator re-evaluates that instruction against its own policy harness and executes it if safe.
 
 The privilege boundary is physical, not just conventional. The Observer process has zero write tools — it cannot mutate infrastructure even if the LLM is manipulated. The Operator has write tools but its MCP servers enforce hard policy (namespace allowlists, replica caps, binary allowlists) that rejects violations before any mutation reaches the cluster, independent of the LLM's judgment. A third optional layer — a LangGraph human-approval checkpointer — can pause execution before writes if `REQUIRE_APPROVAL=1`.
 
@@ -16,7 +16,7 @@ fire_incident.py
       ▼
 ┌─────────────────────────────────────┐
 │  Observer (LangGraph ReAct)         │  read MCP tools only
-│   k8s-ro · pg-alerts · es-logs      │
+│   k8s-ro · prom-alerts · es-logs    │
 └──────────┬──────────────────────────┘
            │  request_remediation()
            │  A2A JSON-RPC (port 9301)
@@ -42,16 +42,16 @@ At startup `build_observer()` creates a `MultiServerMCPClient` connecting to:
 | Logical name | Default URL | Provides |
 |---|---|---|
 | `k8s_ro` | `http://localhost:8101/mcp` | `list_pods`, `get_pod_logs`, `recent_warning_events` |
-| `pg_alerts` | `http://localhost:8102/mcp` | `active_alerts`, `db_health` |
+| `prometheus_alerts` | `http://localhost:8102/mcp` | `active_alerts`, `query_metric` |
 | `es_logs` | `http://localhost:8103/mcp` | `search_logs` |
 
-All three URLs are overridable via `K8S_RO_URL`, `PG_ALERTS_URL`, `ES_LOGS_URL`.
+All three URLs are overridable via `K8S_RO_URL`, `PROMETHEUS_ALERTS_URL`, `ES_LOGS_URL`.
 
 ### Investigation loop
 
 The system prompt encodes a fixed workflow:
 
-1. Collect evidence: pods + events → alerts + DB health → log search.
+1. Collect evidence: pods + events → Prometheus alerts + metric query → log search.
 2. Form a root-cause hypothesis from that evidence.
 3. Decide if a change is warranted.
 4. If yes, call `request_remediation` with exactly one precise instruction.
@@ -272,11 +272,11 @@ In demo mode synthesizes pods from `demo_state` deployments: one pod per replica
 
 Tools: `list_pods(namespace)`, `get_pod_logs(name, namespace, tail_lines)`, `recent_warning_events(namespace, limit)`.
 
-**`pg_alerts.py` (port 8102)**
+**`prometheus_alerts.py` (port 8102)**
 
-In demo mode returns `state["alerts"]` filtered by severity and `state["db_health"]` directly. In real mode connects with a read-only role to a `monitoring` schema (`PG_DSN` required). Severity ordering is numeric (`info=0, warning=1, critical=2`) for `min_severity` filtering.
+In demo mode returns `state["alerts"]` filtered by severity and synthesizes metric results from deployment state. In real mode queries the Prometheus Alertmanager REST API (`ALERTMANAGER_URL`) for `active_alerts` and the Prometheus query API (`PROMETHEUS_URL`) for `query_metric`. Severity ordering is numeric (`info=0, warning=1, critical=2`) for `min_severity` filtering.
 
-Tools: `active_alerts(min_severity)`, `db_health()`.
+Tools: `active_alerts(min_severity)`, `query_metric(query, minutes)`.
 
 **`es_logs.py` (port 8103)**
 
@@ -374,7 +374,7 @@ toolset = MCPToolset(
 )
 ```
 
-This is the same role that `MultiServerMCPClient` plays today. `MCPToolset` is passed to `LlmAgent` instead of `MultiServerMCPClient.get_tools()`. The five MCP servers (`k8s_readonly`, `pg_alerts`, `es_logs`, `k8s_write`, `shell_exec`) require zero changes — they are plain MCP HTTP servers and ADK speaks the same protocol.
+This is the same role that `MultiServerMCPClient` plays today. `MCPToolset` is passed to `LlmAgent` instead of `MultiServerMCPClient.get_tools()`. The five MCP servers (`k8s_readonly`, `prometheus_alerts`, `es_logs`, `k8s_write`, `shell_exec`) require zero changes — they are plain MCP HTTP servers and ADK speaks the same protocol.
 
 ### Option 4 — ADK multi-agent orchestration
 
