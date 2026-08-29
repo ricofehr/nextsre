@@ -1,15 +1,30 @@
 """Host shell-exec MCP server (Operator tool surface) + command harness.
 
-Harness rules (all enforced in-tool, before anything runs):
+This harness is the weakest point of the whole privilege boundary, because an
+under-constrained binary here is a way around every other guardrail in the repo:
+``kubectl delete``/``apply``/``scale`` sidestep the namespace allowlist and
+replica cap in ``k8s_write.py``, and ``kubectl exec -- sh -c ...`` sidesteps the
+binary allowlist itself. Mutating Kubernetes actions must go through
+``k8s_write.py``, where they are guarded and audited.
 
-* binary allowlist - only vetted binaries may be invoked
-* substring denylist - blocks obviously destructive patterns
-* per-binary verb limits - e.g. systemctl may status/restart/reload but not
-  stop/disable/mask
-* hard timeout + truncated output
+Rules, all enforced before anything runs:
 
-DEMO mode returns canned output for allowed commands so the pipeline runs
-without a host to shell into. Real mode runs the command via ``subprocess``.
+* binary allowlist - only vetted binaries, and never path-qualified
+* verb at a fixed position - for binaries that take a subcommand, ``argv[1]``
+  must be the verb and must not be a flag. Scanning for "the first non-flag
+  token" instead is unsafe: kubectl global flags take values, so
+  ``kubectl --cache-dir get delete ns kube-system`` would present ``get`` as the
+  verb while kubectl parses ``--cache-dir=get`` and runs the delete.
+* denied tokens anywhere in argv - mutating subcommands, secret material, and
+  the destructive flags of the binaries that take no verb (``journalctl
+  --vacuum-*``, ``ss -K``). Position-independent, so it holds even if the verb
+  check is ever fooled again.
+* bounded timeout - ``timeout_s`` reaches us from an LLM
+* a minimal environment for the child - the server's own env holds credentials
+
+DEMO mode returns canned output for allowed commands so the pipeline runs without
+a host to shell into. Real mode runs the command via ``subprocess`` - no shell,
+so the argv is never re-parsed by sh.
 """
 
 from __future__ import annotations
@@ -20,44 +35,280 @@ import subprocess
 
 from mcp.server.fastmcp import FastMCP
 
-DEMO = os.environ.get("DEMO_MODE", "1") == "1"
-mcp = FastMCP("shell-exec", host="0.0.0.0", port=int(os.environ.get("PORT", "8202")))
+from common.env import env_flag
+from common.serving import bind_host, port
+
+mcp = FastMCP("shell-exec", host=bind_host(), port=port(default=8202))
 
 ALLOWED_BINARIES = {"kubectl", "systemctl", "journalctl", "df", "free", "ss", "dig", "uptime"}
-DENY_SUBSTRINGS = ("rm -rf", "mkfs", "dd ", ":(){", "shutdown", "reboot", "> /dev", "chmod -R")
-ALLOWED_SYSTEMCTL_VERBS = {"status", "restart", "reload", "is-active"}
+
+# Binaries that take a subcommand. argv[1] must be one of these.
+# kubectl is confined to reads; `systemctl restart|reload` is deliberate - host
+# service remediation is what the Operator is for - so this is a non-destructive
+# allowlist, not a read-only one.
+ALLOWED_VERBS = {
+    "kubectl": {
+        "get",
+        "describe",
+        "logs",
+        "top",
+        "version",
+        "explain",
+        "api-resources",
+        "api-versions",
+        "cluster-info",
+    },
+    "systemctl": {"status", "is-active", "restart", "reload"},
+}
+
+# Rejected wherever they appear, flag or positional. Defence in depth behind the
+# verb check.
+DENIED_TOKENS = {
+    # kubectl mutations - never permitted here; k8s_write.py owns these
+    "annotate",
+    "apply",
+    "attach",
+    "auth",
+    "cordon",
+    "cp",
+    "create",
+    "delete",
+    "drain",
+    "edit",
+    "exec",
+    "label",
+    "patch",
+    "port-forward",
+    "proxy",
+    "replace",
+    "rollout",
+    "run",
+    "scale",
+    "set",
+    "taint",
+    "uncordon",
+    # cluster secret material
+    "secret",
+    "secrets",
+    # kubectl escape hatches: arbitrary API paths, dump's file-write target, and
+    # -f/-k, which take a possibly remote manifest naming the resources to act on
+    "--raw",
+    "dump",
+    "--output-directory",
+    "-f",
+    "--filename",
+    "-k",
+    "--kustomize",
+    # kubectl identity and endpoint redirection: --as escalates through the
+    # Operator's own RBAC, --server/--kubeconfig point it at an attacker's
+    # cluster and hand over the bearer token
+    "--as",
+    "--as-group",
+    "--as-uid",
+    "--server",
+    "--kubeconfig",
+    "--token",
+    "--client-key",
+    "--client-certificate",
+    "--insecure-skip-tls-verify",
+    "--user",
+    "--context",
+    "--cluster",
+    "--username",
+    "--password",
+    # systemctl mutations outside the verb allowlist, and remote dispatch
+    "disable",
+    "kill",
+    "mask",
+    "stop",
+    "-H",
+    "--host",
+    "-M",
+    "--machine",
+    # journalctl destructive flags (it takes no verb)
+    "--vacuum-time",
+    "--vacuum-size",
+    "--vacuum-files",
+    "--rotate",
+    "--flush",
+    "--relinquish-var",
+    "--smart-relinquish-var",
+    "--sync",
+    "--update-catalog",
+    "--setup-keys",
+}
+
+# Binaries that take no verb need a flag *allowlist* rather than a denylist:
+# short flags cluster, so denying "-K" leaves "-Kn", "-nK" and "--kill" open and
+# every bypass is one character away. Anything not listed here is refused.
+ALLOWED_FLAGS = {
+    "ss": {
+        "-t",
+        "-u",
+        "-a",
+        "-n",
+        "-p",
+        "-s",
+        "-l",
+        "-i",
+        "-e",
+        "-m",
+        "-o",
+        "-4",
+        "-6",
+        "-x",
+        "-r",
+        "--tcp",
+        "--udp",
+        "--all",
+        "--numeric",
+        "--processes",
+        "--summary",
+        "--listening",
+        "--info",
+        "--extended",
+        "--memory",
+        "--options",
+    },
+}
+
+# kubectl resource arguments arrive as TYPE, TYPE/NAME or a comma-joined list, and
+# may carry a .group suffix. Splitting on those before matching stops
+# `secret/db-creds`, `pod,secret` and `secrets.v1.` slipping a denied word past.
+_RESOURCE_SEPARATORS = ("/", ",", ".")
+
+MIN_TIMEOUT_S = 1
+MAX_TIMEOUT_S = 60
+
+# The server's own environment carries LLM_API_KEY and any cluster credentials;
+# the child needs none of it.
+_BASE_CHILD_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C"}
+# kubectl cannot reach a cluster without these, so they are forwarded by name
+# rather than by inheriting the whole environment.
+_PASSTHROUGH_ENV = ("HOME", "KUBECONFIG", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT")
 
 _DEMO_OUTPUT = {
     "uptime": " 14:02:11 up 9 days,  3:21,  2 users,  load average: 0.42, 0.51, 0.55",
-    "df": "Filesystem     1K-blocks      Used Available Use% Mounted on\n/dev/root       61252420  31204512  27420112  54% /",
-    "free": "               total        used        free\nMem:        16384000     9120000     2100000",
+    "df": (
+        "Filesystem     1K-blocks      Used Available Use% Mounted on\n"
+        "/dev/root       61252420  31204512  27420112  54% /"
+    ),
+    "free": (
+        "               total        used        free\n"
+        "Mem:        16384000     9120000     2100000"
+    ),
     "systemctl": "Active: active (running)",
 }
 
 
+def clamp_timeout(timeout_s: int) -> int:
+    return max(MIN_TIMEOUT_S, min(timeout_s, MAX_TIMEOUT_S))
+
+
+def _child_env() -> dict[str, str]:
+    """A minimal environment: the server's own holds LLM and cluster credentials."""
+    env = dict(_BASE_CHILD_ENV)
+    for name in _PASSTHROUGH_ENV:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+    return env
+
+
+def _fragments(token: str) -> list[str]:
+    """The parts of a token that must each clear the denylist.
+
+    Drops any ``=value`` suffix (``--vacuum-time=1s``) and splits kubectl resource
+    syntax (``secret/db-creds``, ``pod,secret``, ``secrets.v1.``).
+    """
+    base = token.split("=", 1)[0]
+    parts = [base]
+    for separator in _RESOURCE_SEPARATORS:
+        parts = [piece for part in parts for piece in part.split(separator)]
+    return [part for part in parts if part]
+
+
+def _denied(token: str) -> bool:
+    """True if any fragment of ``token`` is denied.
+
+    Matched both as written and case-folded: short flags are case-sensitive
+    (``ss -K`` kills sockets, ``-k`` does not), while subcommands and resource
+    names are conventionally lower-case.
+    """
+    return any(
+        fragment in DENIED_TOKENS or fragment.lower() in DENIED_TOKENS
+        for fragment in _fragments(token)
+    )
+
+
+def _expand_short_flags(token: str) -> list[str]:
+    """``-tn`` -> ``["-t", "-n"]``; long flags and operands pass through unchanged."""
+    if token.startswith("--") or not token.startswith("-") or token == "-":
+        return [token]
+    return [f"-{char}" for char in token[1:]]
+
+
+def _guard_flags(binary: str, argv: list[str]) -> None:
+    """For verb-less binaries, every flag must be on that binary's allowlist."""
+    allowed = ALLOWED_FLAGS.get(binary)
+    if allowed is None:
+        return
+    for token in argv[1:]:
+        if not token.startswith("-"):
+            continue
+        for flag in _expand_short_flags(token.split("=", 1)[0]):
+            if flag not in allowed:
+                raise PermissionError(
+                    f"{binary} flag '{flag}' is not permitted; allowed: {sorted(allowed)}"
+                )
+
+
 def _harness_check(command: str) -> list[str]:
-    """Raise PermissionError if the command violates policy; else return argv."""
-    if any(bad in command for bad in DENY_SUBSTRINGS):
-        raise PermissionError("command matches a denied pattern")
+    """Raise if the command violates policy; else return the argv to execute."""
     argv = shlex.split(command)
     if not argv:
         raise ValueError("empty command")
-    if argv[0] not in ALLOWED_BINARIES:
+
+    binary = argv[0]
+    if "/" in binary:
+        raise PermissionError("binaries must be named, not path-qualified")
+    if binary not in ALLOWED_BINARIES:
         raise PermissionError(
-            f"binary '{argv[0]}' is not on the allowlist {sorted(ALLOWED_BINARIES)}"
+            f"binary '{binary}' is not on the allowlist {sorted(ALLOWED_BINARIES)}"
         )
-    if argv[0] == "systemctl" and len(argv) > 1 and argv[1] not in ALLOWED_SYSTEMCTL_VERBS:
-        raise PermissionError(f"systemctl verb '{argv[1]}' is not permitted")
+
+    denied = [token for token in argv if _denied(token)]
+    if denied:
+        raise PermissionError(f"command contains denied token(s): {denied}")
+
+    allowed_verbs = ALLOWED_VERBS.get(binary)
+    if allowed_verbs is not None:
+        if len(argv) < 2:
+            raise PermissionError(f"'{binary}' requires one of {sorted(allowed_verbs)}")
+        verb = argv[1]
+        if verb.startswith("-"):
+            raise PermissionError(
+                f"'{binary}' must be followed directly by its verb, not by '{verb}'"
+            )
+        if verb not in allowed_verbs:
+            raise PermissionError(
+                f"{binary} verb '{verb}' is not permitted; allowed: {sorted(allowed_verbs)}"
+            )
+
+    _guard_flags(binary, argv)
     return argv
 
 
 @mcp.tool()
 def run_command(command: str, timeout_s: int = 20) -> dict:
-    """Run a vetted diagnostic/remediation shell command under the harness."""
+    """Run a vetted, non-destructive diagnostic shell command under the harness."""
     argv = _harness_check(command)
+    timeout = clamp_timeout(timeout_s)
 
-    if not DEMO:  # pragma: no cover
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    if not env_flag("DEMO_MODE", default=True):  # pragma: no cover - needs a real host
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, env=_child_env()
+        )
         return {
             "command": command,
             "exit_code": proc.returncode,
@@ -70,4 +321,5 @@ def run_command(command: str, timeout_s: int = 20) -> dict:
 
 
 if __name__ == "__main__":
+    env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
     mcp.run(transport="streamable-http")

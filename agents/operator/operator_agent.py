@@ -16,6 +16,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import create_react_agent
 
+from common.env import env_flag
 from common.llm import local_llm
 
 K8S_WRITE_URL = os.environ.get("K8S_WRITE_URL", "http://localhost:8201/mcp")
@@ -45,7 +46,7 @@ Rules:
 async def build_operator():
     tools = await _mcp.get_tools()
     kwargs = {}
-    if os.environ.get("REQUIRE_APPROVAL", "0") == "1":
+    if env_flag("REQUIRE_APPROVAL", default=False):
         # Pause before any tool executes; a human resumes via a follow-up turn.
         kwargs = {"checkpointer": InMemorySaver(), "interrupt_before": ["tools"]}
     return create_react_agent(local_llm(), tools, prompt=SYSTEM, **kwargs)

@@ -25,13 +25,23 @@ Start each service in a separate terminal — 5 MCP servers on ports 8101–8103
 
 ### Test
 ```bash
-python -m tests.smoke_test    # offline; no LLM or cluster required
+pip install -e ".[dev]"
+pytest                        # full suite; offline, no LLM or cluster required
+python -m tests.smoke_test    # dependency-free subset
 ```
 
-The smoke test covers four scenarios: read tool validation, harness rejection, recovery loop, and A2A round-trip.
+`tests/test_harness.py` holds the policy-harness regressions — every case there is a
+command or config that the harness once accepted. `tests/test_incident_flow.py` covers
+read tools, the recovery loop and the A2A round-trip. `tests/smoke_test.py` is a
+pytest-free demo-flow check only; it deliberately does not assert the harness, so a
+green smoke run says nothing about the security boundary.
 
 ### Lint / Format
-Not configured — add `ruff` or `black` if needed.
+```bash
+black . && isort . && flake8
+```
+Configured in `pyproject.toml` (`[tool.black]`, `[tool.isort]`) and `.flake8`; line
+length 100.
 
 ## Architecture
 

@@ -1,115 +1,93 @@
 """Kubernetes WRITE MCP server (Operator tool surface) + policy harness.
 
-The harness is enforced *here*, inside the tools - the innermost,
-non-bypassable line of defense. No prompt, caller, or LLM can talk its way
-past these checks because they are plain code that runs before any mutation:
+The harness is enforced *here*, inside the tools - the innermost line of defense
+for Kubernetes mutations. No prompt, caller, or LLM can talk its way past these
+checks because they are plain code that runs before any mutation:
 
-* namespace allowlist + protected-namespace denylist
+* protected-namespace denylist, evaluated before the allowlist
+* namespace allowlist, which refuses everything when it parses empty
+* RFC 1123 validation of every namespace and object name
 * bounded parameters (replica cap)
 * every action returns an audit record of exactly what was changed
 
-In DEMO mode the mutation is applied to the shared state file (so the
-Observer sees the incident actually resolve). Real mode calls the K8s API.
+Note that this harness only covers *this* server. ``shell_exec`` enforces its own,
+and must keep ``kubectl`` read-only - otherwise a shell command would be a way
+around everything above.
 """
 
 from __future__ import annotations
 
 import datetime
-import os
+import re
 
 from mcp.server.fastmcp import FastMCP
 
-from . import demo_state
+from common.env import env_csv, env_flag, env_int
+from common.serving import bind_host, port
 
-DEMO = os.environ.get("DEMO_MODE", "1") == "1"
-mcp = FastMCP("k8s-write", host="0.0.0.0", port=int(os.environ.get("PORT", "8201")))
+from . import backends
+
+mcp = FastMCP("k8s-write", host=bind_host(), port=port(default=8201))
 
 # ---- harness configuration -------------------------------------------------
-ALLOWED_NAMESPACES = set(
-    os.environ.get("ALLOWED_NAMESPACES", "web,payments,staging").split(",")
-)
 PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "default"}
-MAX_REPLICAS = int(os.environ.get("MAX_REPLICAS", "20"))
+DEFAULT_ALLOWED_NAMESPACES = "web,payments,staging"
+DEFAULT_MAX_REPLICAS = 20
+
+# Kubernetes object names and namespaces are RFC 1123 labels. Validating them
+# keeps anything shell- or path-shaped from reaching a backend in the first place.
+_RFC1123 = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_MAX_NAME_LENGTH = 63
+
+
+def _allowed_namespaces() -> set[str]:
+    """Read the allowlist at call time so the policy is not frozen at import."""
+    return env_csv("ALLOWED_NAMESPACES", default=DEFAULT_ALLOWED_NAMESPACES)
+
+
+def _max_replicas() -> int:
+    return env_int("MAX_REPLICAS", default=DEFAULT_MAX_REPLICAS)
+
+
+def _guard_name(value: str, kind: str) -> None:
+    if not value or len(value) > _MAX_NAME_LENGTH or not _RFC1123.match(value):
+        raise ValueError(f"{kind} {value!r} is not a valid RFC 1123 name")
 
 
 def _guard_ns(namespace: str) -> None:
+    _guard_name(namespace, "namespace")
     if namespace in PROTECTED_NAMESPACES:
         raise PermissionError(f"namespace '{namespace}' is protected; writes refused")
-    if namespace not in ALLOWED_NAMESPACES:
-        raise PermissionError(
-            f"namespace '{namespace}' not in allowlist {sorted(ALLOWED_NAMESPACES)}"
-        )
+    allowed = _allowed_namespaces()
+    if not allowed:
+        raise PermissionError("ALLOWED_NAMESPACES is empty; all writes refused")
+    if namespace not in allowed:
+        raise PermissionError(f"namespace '{namespace}' not in allowlist {sorted(allowed)}")
 
 
-def _real_apps():  # pragma: no cover
-    from kubernetes import client, config
-
-    try:
-        config.load_incluster_config()
-    except Exception:
-        config.load_kube_config()
-    return client.AppsV1Api()
+def _guard_target(name: str, namespace: str) -> None:
+    _guard_ns(namespace)
+    _guard_name(name, "deployment")
 
 
 @mcp.tool()
 def restart_deployment(name: str, namespace: str) -> dict:
     """Rolling-restart a deployment. Reversible, zero-downtime. Resolves crash loops."""
-    _guard_ns(namespace)
+    _guard_target(name, namespace)
     stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-    if not DEMO:  # pragma: no cover
-        apps = _real_apps()
-        patch = {
-            "spec": {"template": {"metadata": {"annotations": {
-                "sre-agent/restartedAt": stamp}}}}
-        }
-        apps.patch_namespaced_deployment(name, namespace, patch)
-        return {"action": "restart_deployment", "name": name,
-                "namespace": namespace, "restartedAt": stamp}
-
-    def _mutate(state: dict) -> None:
-        key = f"{namespace}/{name}"
-        dep = state["deployments"].get(key)
-        if dep is None:
-            raise ValueError(f"deployment {key} not found")
-        dep.update(healthy=True, available=dep["replicas"], restarts=0,
-                   reason="", last_error="")
-        for alert in state["alerts"]:
-            if alert["service"] == name:
-                alert["state"] = "resolved"
-
-    demo_state.update(_mutate)
-    return {"action": "restart_deployment", "name": name, "namespace": namespace,
-            "restartedAt": stamp, "result": "rollout triggered; pods recovered"}
+    return backends.k8s_write().restart_deployment(name, namespace, stamp)
 
 
 @mcp.tool()
 def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
     """Scale a deployment. Hard-capped at MAX_REPLICAS by the harness."""
-    _guard_ns(namespace)
-    if not 0 <= replicas <= MAX_REPLICAS:
-        raise ValueError(f"replicas must be between 0 and {MAX_REPLICAS}")
-
-    if not DEMO:  # pragma: no cover
-        apps = _real_apps()
-        apps.patch_namespaced_deployment_scale(
-            name, namespace, {"spec": {"replicas": replicas}})
-        return {"action": "scale_deployment", "name": name,
-                "namespace": namespace, "replicas": replicas}
-
-    def _mutate(state: dict) -> None:
-        key = f"{namespace}/{name}"
-        dep = state["deployments"].get(key)
-        if dep is None:
-            raise ValueError(f"deployment {key} not found")
-        dep["replicas"] = replicas
-        if dep["healthy"]:
-            dep["available"] = replicas
-
-    demo_state.update(_mutate)
-    return {"action": "scale_deployment", "name": name,
-            "namespace": namespace, "replicas": replicas}
+    _guard_target(name, namespace)
+    ceiling = _max_replicas()
+    if not 0 <= replicas <= ceiling:
+        raise ValueError(f"replicas must be between 0 and {ceiling}")
+    return backends.k8s_write().scale_deployment(name, namespace, replicas)
 
 
 if __name__ == "__main__":
+    env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
     mcp.run(transport="streamable-http")
