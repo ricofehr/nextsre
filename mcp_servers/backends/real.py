@@ -32,6 +32,21 @@ def _kube_api():  # pragma: no cover - needs a live cluster
     return client.CoreV1Api(), client.AppsV1Api()
 
 
+def _waiting_reason(statuses) -> str:  # pragma: no cover - needs a live cluster
+    """The first container's waiting reason, e.g. CrashLoopBackOff.
+
+    Kubernetes pod *phases* are only Pending/Running/Succeeded/Failed/Unknown -
+    a crash-looping pod reports phase Running. The signal the Observer actually
+    needs lives in the container status, so it is surfaced as its own field
+    rather than folded into ``phase``.
+    """
+    for status in statuses:
+        waiting = getattr(status.state, "waiting", None) if status.state else None
+        if waiting and waiting.reason:
+            return waiting.reason
+    return ""
+
+
 def _checked_url(name: str, default: str) -> str:
     """Return ``name`` from the environment, rejecting non-HTTP schemes."""
     url = os.environ.get(name, default)
@@ -52,6 +67,7 @@ class RealK8sRead:  # pragma: no cover - needs a live cluster
                     "name": pod.metadata.name,
                     "namespace": namespace,
                     "phase": pod.status.phase,
+                    "reason": _waiting_reason(statuses),
                     "restarts": sum(c.restart_count for c in statuses),
                     "ready": bool(statuses) and all(c.ready for c in statuses),
                 }
@@ -113,14 +129,18 @@ class RealAlerts:  # pragma: no cover - needs a live Prometheus
             if SEVERITY_ORDER.get(severity, 0) < min_severity_rank:
                 continue
             annotations = alert.get("annotations", {})
-            ends_at = alert.get("endsAt", "")
             alerts.append(
                 {
                     "id": alert.get("fingerprint", ""),
                     "severity": severity,
                     "service": labels.get("job", labels.get("service", "")),
                     "summary": annotations.get("summary", annotations.get("description", "")),
-                    "state": "firing" if not ends_at or ends_at.startswith("0001") else "resolved",
+                    # The request already filters active/unsilenced/uninhibited, so
+                    # everything here is firing. Deriving it from endsAt instead
+                    # marked every alert "resolved": Alertmanager v2 always
+                    # populates endsAt (startsAt + resolve_timeout for an active
+                    # alert), never the Go zero time, so the check was always false.
+                    "state": alert.get("status", {}).get("state", "firing"),
                 }
             )
         return alerts

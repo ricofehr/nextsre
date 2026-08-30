@@ -10,12 +10,17 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from common.env import env_flag
-from common.serving import bind_host, port
+from common.serving import bind_host, port, transport_security
 
 from . import backends
 from .backends.ports import DEFAULT_SEVERITY, SEVERITY_ORDER
 
-mcp = FastMCP("prometheus-alerts", host=bind_host(), port=port(default=8102))
+mcp = FastMCP(
+    "prometheus-alerts",
+    host=bind_host(),
+    port=port(default=8102),
+    transport_security=transport_security("prometheus-alerts"),
+)
 
 
 @mcp.tool()

@@ -23,16 +23,26 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from common.env import env_csv, env_flag, env_int
-from common.serving import bind_host, port
+from common.serving import bind_host, port, transport_security
 
 from . import backends
 
-mcp = FastMCP("k8s-write", host=bind_host(), port=port(default=8201))
+mcp = FastMCP(
+    "k8s-write",
+    host=bind_host(),
+    port=port(default=8201),
+    transport_security=transport_security("k8s-write"),
+)
 
 # ---- harness configuration -------------------------------------------------
 PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "default"}
 DEFAULT_ALLOWED_NAMESPACES = "web,payments,staging"
 DEFAULT_MAX_REPLICAS = 20
+# Scaling to zero is a complete outage of the service under investigation, and a
+# model reasoning about a crash loop can plausibly land on it as "least
+# destructive". A harness whose job is to backstop that judgment should not
+# certify it as in-policy, so it needs a separate, explicit opt-in.
+MIN_REPLICAS = 1
 
 # Kubernetes object names and namespaces are RFC 1123 labels. Validating them
 # keeps anything shell- or path-shaped from reaching a backend in the first place.
@@ -83,8 +93,12 @@ def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
     """Scale a deployment. Hard-capped at MAX_REPLICAS by the harness."""
     _guard_target(name, namespace)
     ceiling = _max_replicas()
-    if not 0 <= replicas <= ceiling:
-        raise ValueError(f"replicas must be between 0 and {ceiling}")
+    floor = 0 if env_flag("ALLOW_SCALE_TO_ZERO", default=False) else MIN_REPLICAS
+    if not floor <= replicas <= ceiling:
+        raise ValueError(
+            f"replicas must be between {floor} and {ceiling}"
+            + ("" if floor == 0 else "; set ALLOW_SCALE_TO_ZERO=1 to permit a full stop")
+        )
     return backends.k8s_write().scale_deployment(name, namespace, replicas)
 
 

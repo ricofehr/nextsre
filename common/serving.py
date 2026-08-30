@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import os
 
-from common.env import env_int
+from mcp.server.transport_security import TransportSecuritySettings
+
+from common.env import env_csv, env_int
 
 DEFAULT_BIND_HOST = "127.0.0.1"
+DEFAULT_ALLOWED_HOSTS = "127.0.0.1,localhost"
 
 
 def bind_host() -> str:
@@ -26,3 +29,30 @@ def bind_host() -> str:
 
 def port(*, default: int) -> int:
     return env_int("PORT", default=default)
+
+
+def transport_security(service: str) -> TransportSecuritySettings:
+    """Host/Origin validation for a streamable-http MCP server.
+
+    FastMCP passes ``transport_security=None`` straight to
+    ``TransportSecurityMiddleware``, which reads None as
+    ``enable_dns_rebinding_protection=False`` "for backwards compatibility" -
+    the inverse of ``TransportSecuritySettings``' own default. Leaving it unset
+    therefore turns the check off silently.
+
+    That matters because these servers have no authentication. A browser on a
+    machine running one of them can be pointed at an attacker domain that
+    re-resolves to 127.0.0.1; the request is same-origin as far as CORS is
+    concerned, so without a Host check the page reaches the tool surface -
+    including shell-exec.
+
+    ``MCP_ALLOWED_HOSTS`` extends the list for deployments (compose adds the
+    service name, since peers address each other by it).
+    """
+    allowed = env_csv("MCP_ALLOWED_HOSTS", default=DEFAULT_ALLOWED_HOSTS) | {service}
+    hosts = sorted({entry for host in allowed for entry in (host, f"{host}:*")})
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=sorted({f"http://{host}" for host in allowed} | {"null"}),
+    )

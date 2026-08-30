@@ -24,17 +24,25 @@ DEFAULT_PROMPT = "Investigate the active incident and remediate it if it is safe
 async def main() -> None:
     prompt = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROMPT
 
-    # Reset the shared demo state to the seed incident. Only works when this
-    # process can see the same state file as the MCP servers - under compose the
-    # file lives on a volume the servers share and this script does not, so a
-    # missing/unwritable path is expected rather than an error.
+    # Reset the seed incident - but only when this process can actually see the
+    # servers' state file. Under compose it lives on a volume this script does
+    # not mount, so resetting here would rewrite a *different* file and report
+    # success while the servers kept their post-remediation healthy state. That
+    # lie costs an hour to debug, so say plainly when the reset was skipped.
     from mcp_servers import demo_state
 
-    try:
-        demo_state.reset()
-        print("• demo state reset to seed incident (payments-api CrashLoopBackOff)\n")
-    except OSError as exc:
-        print(f"• skipping demo-state reset ({exc}); the servers keep their own state\n")
+    if "DEMO_STATE_FILE" not in os.environ:
+        print(
+            "• skipping demo-state reset: DEMO_STATE_FILE is unset, so this process\n"
+            "  does not share the servers' state file (expected under docker compose).\n"
+            "  The incident may already be resolved from a previous run.\n"
+        )
+    else:
+        try:
+            demo_state.reset()
+            print("• demo state reset to seed incident (payments-api CrashLoopBackOff)\n")
+        except OSError as exc:
+            print(f"• could not reset demo state ({exc}); the servers keep their own\n")
 
     print(f"→ sending to Observer: {prompt}\n")
 

@@ -18,7 +18,11 @@ from mcp_servers import backends, demo_state, es_logs, k8s_readonly, k8s_write, 
 
 def test_read_tools_report_the_incident():
     pods = k8s_readonly.list_pods("payments")
-    assert pods and all(p["phase"] == "CrashLoopBackOff" for p in pods)
+    # phase is the K8s pod phase (a crash-looping pod is Running); the
+    # CrashLoopBackOff signal is the container waiting reason.
+    assert pods and all(p["phase"] == "Running" for p in pods)
+    assert all(p["reason"] == "CrashLoopBackOff" for p in pods)
+    assert not any(p["ready"] for p in pods)
 
     assert "OOMKilled" in k8s_readonly.get_pod_logs("payments-api-00", "payments")
 

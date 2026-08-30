@@ -282,6 +282,8 @@ The seed state encodes a real-looking incident: `payments-api` in `CrashLoopBack
 
 In demo mode synthesizes pods from `demo_state` deployments: one pod per replica, all with `phase="Running"` and restarts/reason drawn from the deployment record. In real mode uses the official `kubernetes` client with kubeconfig or in-cluster service account.
 
+`phase` and `reason` are separate fields in both adapters, because they are separate things in Kubernetes: a pod phase is only `Pending|Running|Succeeded|Failed|Unknown`, and a crash-looping pod reports phase `Running`. `CrashLoopBackOff` is a *container waiting reason*. The demo previously reported it as the phase — a contract the real adapter could not satisfy, so the crash-loop signal would have vanished the moment `DEMO_MODE=0` was set against a real cluster.
+
 Tools: `list_pods(namespace)`, `get_pod_logs(name, namespace, tail_lines)`, `recent_warning_events(namespace, limit)`.
 
 **`prometheus_alerts.py` (port 8102)**

@@ -131,7 +131,10 @@ share one cluster.)
 ## The harness (defense in depth)
 
 1. **In-tool policy.** `k8s_write` rejects protected and non-allowlisted
-   namespaces, validates every object name, and caps replicas. `shell_exec`
+   namespaces, validates every object name, caps replicas, and refuses scaling to
+   zero unless `ALLOW_SCALE_TO_ZERO=1` — a full stop of the service under
+   investigation is not something the backstop should certify as in-policy.
+   `shell_exec`
    enforces a binary allowlist, a **per-binary verb allowlist pinned to
    `argv[1]`**, a position-independent **token denylist** (mutating kubectl
    subcommands, Secret material, identity/endpoint redirection), and a **flag
@@ -163,12 +166,22 @@ authorization model:
 - MCP servers bind `127.0.0.1` unless `MCP_BIND_HOST` says otherwise; compose
   sets `0.0.0.0` because there the container network is the boundary. Anything
   that can open a socket to `shell-exec:8202` gets command execution.
+- Host/Origin validation is **on**. `FastMCP` treats an unset `transport_security`
+  as "DNS-rebinding protection off" — the inverse of the library's own default —
+  so every server passes it explicitly. Without it, a browser on a machine running
+  these servers can be steered to the tool surface by an attacker domain that
+  re-resolves to `127.0.0.1`: same-origin as far as CORS is concerned, so the
+  Host check is the only thing standing in the way. Extend with `MCP_ALLOWED_HOSTS`.
 - Containers run as a non-root user.
 
 **Residual risk, accepted for a demo:**
 
 - `dig` stays allowlisted for diagnostics and is a viable DNS exfiltration channel;
   `journalctl` reads host logs (its destructive `--vacuum-*`/`--rotate` flags are denied).
+- Secret material is denied, but `kubectl get` still reads any other resource —
+  `configmaps`, `serviceaccounts`, pod env — and returns it into the LLM transcript.
+  Closing that properly needs a resource *allowlist*, not more denied words; scope
+  the Operator's RBAC as the primary control.
 - `systemctl restart|reload` is permitted on any unit — deliberate, since host
   service remediation is what the Operator is for, but it is not namespace-scoped
   or audited the way `k8s_write.py` actions are.

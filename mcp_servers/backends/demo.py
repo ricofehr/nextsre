@@ -23,7 +23,12 @@ class DemoK8sRead:
                 {
                     "name": f"{dep['name']}-{i:02d}",
                     "namespace": namespace,
-                    "phase": "Running" if dep["healthy"] else dep["reason"],
+                    # A crash-looping pod's phase really is Running; the
+                    # CrashLoopBackOff signal is a container waiting reason. The
+                    # demo reported it as the phase, which is a contract the real
+                    # adapter cannot satisfy - so both now fill both fields.
+                    "phase": "Running",
+                    "reason": "" if dep["healthy"] else dep["reason"],
                     "restarts": dep["restarts"],
                     "ready": dep["healthy"],
                 }
