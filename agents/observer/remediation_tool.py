@@ -15,6 +15,7 @@ from langchain_core.tools import tool
 from agents.a2a_app import call_agent
 
 OPERATOR_URL = os.environ.get("OPERATOR_URL", "http://localhost:9301")
+OPERATOR_TIMEOUT_S = 120.0
 
 
 @tool
@@ -26,4 +27,7 @@ async def request_remediation(action: str) -> str:
     Returns the operator's report. This is the only way to change anything;
     you cannot mutate the cluster yourself.
     """
-    return await call_agent(OPERATOR_URL, action)
+    # A smaller budget than the caller's own: this hop is nested inside the
+    # Observer's task, and with equal timeouts the outer one always fires first,
+    # surfacing a slow-but-successful remediation as a client timeout.
+    return await call_agent(OPERATOR_URL, action, timeout=OPERATOR_TIMEOUT_S)

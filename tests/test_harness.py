@@ -155,6 +155,17 @@ def test_negative_replicas_refused():
         k8s_write.scale_deployment("web", "web", -1)
 
 
+def test_scale_to_zero_refused_by_default():
+    """A full stop of the service under investigation is not "in policy"."""
+    with pytest.raises(ValueError, match="ALLOW_SCALE_TO_ZERO"):
+        k8s_write.scale_deployment("web", "web", 0)
+
+
+def test_scale_to_zero_allowed_on_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("ALLOW_SCALE_TO_ZERO", "1")
+    assert k8s_write.scale_deployment("web", "web", 0)["replicas"] == 0
+
+
 def test_allowlist_tolerates_whitespace(monkeypatch):
     """regression: ' web , payments ' parsed to entries that matched nothing."""
     monkeypatch.setenv("ALLOWED_NAMESPACES", " web , payments ")

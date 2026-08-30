@@ -36,9 +36,14 @@ import subprocess
 from mcp.server.fastmcp import FastMCP
 
 from common.env import env_flag
-from common.serving import bind_host, port
+from common.serving import bind_host, port, transport_security
 
-mcp = FastMCP("shell-exec", host=bind_host(), port=port(default=8202))
+mcp = FastMCP(
+    "shell-exec",
+    host=bind_host(),
+    port=port(default=8202),
+    transport_security=transport_security("shell-exec"),
+)
 
 ALLOWED_BINARIES = {"kubectl", "systemctl", "journalctl", "df", "free", "ss", "dig", "uptime"}
 
@@ -306,9 +311,19 @@ def run_command(command: str, timeout_s: int = 20) -> dict:
     timeout = clamp_timeout(timeout_s)
 
     if not env_flag("DEMO_MODE", default=True):  # pragma: no cover - needs a real host
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, env=_child_env()
-        )
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout, env=_child_env()
+            )
+        except subprocess.TimeoutExpired:
+            # A structured result, not an exception: the caller is an LLM deciding
+            # what to do next, and "the command timed out" is information.
+            return {
+                "command": command,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"timed out after {timeout}s",
+            }
         return {
             "command": command,
             "exit_code": proc.returncode,

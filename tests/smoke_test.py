@@ -29,7 +29,7 @@ def check_read_tools() -> None:
 
     demo_state.reset()
     pods = k8s_readonly.list_pods("payments")
-    assert pods and all(p["phase"] == "CrashLoopBackOff" for p in pods), pods
+    assert pods and all(p["reason"] == "CrashLoopBackOff" for p in pods), pods
     assert "OOMKilled" in k8s_readonly.get_pod_logs("payments-api-00", "payments")
     assert any(a["severity"] == "critical" for a in prometheus_alerts.active_alerts("warning"))
     assert any(d["level"] == "ERROR" for d in es_logs.search_logs("error", service="payments-api"))
