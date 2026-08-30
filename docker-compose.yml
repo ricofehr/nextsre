@@ -4,6 +4,12 @@
 #
 # The local LLM is expected on the host (Ollama / llama-server). Containers
 # reach it via host.docker.internal (see extra_hosts). Override LLM_* in .env.
+#
+# Only the Observer publishes a port. The MCP servers and the Operator are
+# reachable on the compose network only: none of them authenticates its caller,
+# so anything that can open a socket to shell-exec:8202 gets command execution,
+# and anything that can reach operator:9301 can drive the write agent directly
+# without the Observer ever being involved.
 
 x-llm-env: &llm-env
   LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
@@ -13,6 +19,9 @@ x-llm-env: &llm-env
 x-demo-env: &demo-env
   DEMO_MODE: ${DEMO_MODE:-1}
   DEMO_STATE_FILE: /data/cluster_state.json
+  # Containers need to accept connections from their compose-network peers.
+  # The code defaults to 127.0.0.1; binding wider is deliberate and lives here.
+  MCP_BIND_HOST: 0.0.0.0
 
 x-host: &host-gateway
   extra_hosts:
@@ -67,7 +76,8 @@ services:
       K8S_WRITE_URL: http://k8s-write:8201/mcp
       SHELL_URL: http://shell-exec:8202/mcp
       REQUIRE_APPROVAL: ${REQUIRE_APPROVAL:-0}
-    ports: [ "9301:9301" ]
+    # Intentionally NOT published: the write agent is reachable from the
+    # Observer over the compose network and from nowhere else.
     depends_on: [ k8s-write, shell-exec ]
 
   observer:

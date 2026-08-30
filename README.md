@@ -35,14 +35,16 @@ loaded via `langchain-mcp-adapters`. Agent-to-agent communication uses the
 | `mcp_servers/k8s_readonly.py` | read pods, logs, warning events |
 | `mcp_servers/prometheus_alerts.py` | active alerts, PromQL metric query |
 | `mcp_servers/es_logs.py` | search recent logs |
-| `mcp_servers/k8s_write.py` | restart/scale deployments — **harness: namespace allowlist + replica cap** |
-| `mcp_servers/shell_exec.py` | run host commands — **harness: binary allowlist + pattern denylist + verb limits** |
+| `mcp_servers/k8s_write.py` | restart/scale deployments — **harness: namespace allowlist + replica cap + name validation** |
+| `mcp_servers/shell_exec.py` | run host commands — **harness: binary allowlist + per-binary non-destructive verb allowlist + token denylist** |
+| `mcp_servers/backends/` | demo vs real adapters behind a port per domain; selection is lazy, so the tools stay importable and testable |
 | `mcp_servers/demo_state.py` | shared synthetic "cluster" so the demo runs without real infra |
+| `common/env.py` | fail-closed env parsing — an unrecognised `DEMO_MODE` raises instead of quietly meaning "not demo" |
 | `agents/observer/` | read agent: card, MCP read tools, the A2A `request_remediation` delegate tool |
 | `agents/operator/` | write agent: card, MCP write tools, optional human approval gate |
 | `agents/a2a_app.py` | shared: Starlette app builder, LangGraph→A2A streaming executor, A2A client helper |
 | `scripts/fire_incident.py` | reset the seed incident and fire it at the Observer |
-| `tests/smoke_test.py` | offline checks (no LLM/cluster): harness, recovery loop, A2A round-trip |
+| `tests/` | offline suite (no LLM/cluster): harness regressions, recovery loop, A2A round-trip |
 
 ## Demo mode (default)
 
@@ -50,7 +52,13 @@ loaded via `langchain-mcp-adapters`. Agent-to-agent communication uses the
 is in `CrashLoopBackOff` (OOMKilled). The read servers report it; the write
 server's `restart_deployment` flips the shared state to healthy and resolves
 the alert — so the Observer's verification re-read actually sees recovery.
-No Kubernetes, Postgres, or Elasticsearch required.
+No Kubernetes, Prometheus, or Elasticsearch required.
+
+`DEMO_MODE` is parsed strictly: `1/0/true/false/yes/no/on/off` are accepted and
+anything else raises — at startup for the MCP servers, and again before any tool
+acts. An unrecognised value must not be read as "not demo", which is what a bare
+`== "1"` comparison does; that would silently point the write tools at real
+infrastructure.
 
 ## Run it
 
@@ -73,8 +81,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Seven containers start: five MCP servers plus the two agents. The Observer is
-on `localhost:9300`, the Operator on `localhost:9301`.
+Seven containers start: five MCP servers plus the two agents. Only the Observer
+is published, on `localhost:9300`; everything else is reachable on the compose
+network only (see [Network boundary](#network-boundary)).
 
 ### 3. Fire the seed incident
 
@@ -87,12 +96,23 @@ python -m scripts.fire_incident
 python -m scripts.fire_incident "why are payments-api pods crashing?"
 ```
 
+## Tests and linting
+
+```bash
+pip install -e ".[dev]"
+pytest                      # full suite, including harness-bypass regressions
+python -m tests.smoke_test  # pytest-free demo-flow check (does not assert the harness)
+black --check . && isort --check-only . && flake8
+pip-audit
+```
+
 You'll see the Observer's Task stream status updates (`calling tools: ...`)
 as it gathers evidence and delegates the fix, then a final incident report.
 
 ## Run without Docker
 
-In four terminals (or use `&`), with the venv active and `.env` exported:
+In seven terminals (or use `&`), with the venv active and `.env` exported. Every
+service binds loopback here, so nothing is exposed to the network:
 
 ```bash
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.k8s_readonly   # :8101
@@ -110,17 +130,52 @@ share one cluster.)
 
 ## The harness (defense in depth)
 
-1. **In-tool policy (non-bypassable).** `k8s_write` rejects protected/
-   non-allowlisted namespaces and caps replicas; `shell_exec` enforces a binary
-   allowlist, a destructive-pattern denylist, and per-binary verb limits. These
-   run before any mutation regardless of prompt or caller.
+1. **In-tool policy.** `k8s_write` rejects protected and non-allowlisted
+   namespaces, validates every object name, and caps replicas. `shell_exec`
+   enforces a binary allowlist, a **per-binary verb allowlist pinned to
+   `argv[1]`**, a position-independent **token denylist** (mutating kubectl
+   subcommands, Secret material, identity/endpoint redirection), and a **flag
+   allowlist** for the binaries that take no verb. These run before any mutation
+   regardless of prompt or caller.
 2. **Behavioural policy.** The Operator's system prompt mandates least-
-   destructive actions and honest reporting.
+   destructive actions and honest reporting. The Observer's prompt marks all tool
+   output as untrusted data, since logs and alert annotations are written by the
+   workloads under investigation.
 3. **Human approval gate (optional).** `REQUIRE_APPROVAL=1` builds the Operator
    graph with `interrupt_before=["tools"]` + a checkpointer, pausing before any
    tool runs so a human can approve/reject.
 
-`tests/smoke_test.py` asserts layer 1 holds (out-of-policy actions raise).
+Layer 1 is only as strong as its weakest tool. `shell_exec` must keep `kubectl`
+read-only: an unrestricted `kubectl` is a way around *everything* in `k8s_write`
+— `kubectl delete`/`apply`/`scale` ignore the namespace allowlist and replica
+cap, and `kubectl exec -- sh -c '…'` re-enters a shell and defeats the binary
+allowlist itself. `tests/test_harness.py` pins that shut with explicit
+regressions; run `pytest` before trusting the boundary.
+
+### Network boundary
+
+None of these services authenticates its caller, so reachability *is* the
+authorization model:
+
+- Only the Observer publishes a port (`9300`). The Operator is deliberately not
+  published — anything that can reach `9301` drives the write agent directly,
+  with the Observer bypassed entirely.
+- MCP servers bind `127.0.0.1` unless `MCP_BIND_HOST` says otherwise; compose
+  sets `0.0.0.0` because there the container network is the boundary. Anything
+  that can open a socket to `shell-exec:8202` gets command execution.
+- Containers run as a non-root user.
+
+**Residual risk, accepted for a demo:**
+
+- `dig` stays allowlisted for diagnostics and is a viable DNS exfiltration channel;
+  `journalctl` reads host logs (its destructive `--vacuum-*`/`--rotate` flags are denied).
+- `systemctl restart|reload` is permitted on any unit — deliberate, since host
+  service remediation is what the Operator is for, but it is not namespace-scoped
+  or audited the way `k8s_write.py` actions are.
+- No authentication or TLS anywhere. Do not expose these ports beyond the host.
+- Runtime dependencies are pinned to exact versions, but without hashes, and the
+  optional `real` extra is version-ranged rather than pinned.
+- `REQUIRE_APPROVAL=1` halts remediation rather than gating it — see DEEP.md.
 
 ## Switching to real backends
 
@@ -143,6 +198,10 @@ your second line, RBAC is your first.
   `create_jsonrpc_routes`), cards use `supported_interfaces`, text parts are
   `Part(text=...)`, the well-known path is `/.well-known/agent-card.json`, and a
   `Task` must be enqueued before any status event. All handled in `a2a_app.py`.
-- Versions are pinned in `pyproject.toml` for exactly this reason.
+- Runtime versions are pinned exactly in `pyproject.toml` for that reason. The
+  optional `real` extra is version-ranged, not pinned.
+- `mcp` stays on 1.x: `langchain-mcp-adapters` requires `mcp<2.0.0`, and 2.x
+  renames `FastMCP` to `MCPServer`. The pin clears PYSEC-2026-3483, which affects
+  the deprecated websocket transport this repo does not use.
 - The demo state file is last-write-wins across processes — fine for a demo,
   not a datastore.

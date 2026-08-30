@@ -11,23 +11,25 @@ Contains:
 
 from __future__ import annotations
 
+import logging
 from typing import Awaitable, Callable
 
 import httpx
-from starlette.applications import Starlette
-
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
+from a2a.helpers import new_task_from_user_message
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes.agent_card_routes import create_agent_card_routes
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
-from a2a.helpers import new_task_from_user_message
 from a2a.types import AgentCard, Part, TaskState
 from a2a.utils import DEFAULT_RPC_URL
+from starlette.applications import Starlette
 
 from common.a2a_helpers import render_event, user_text_request
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -40,7 +42,7 @@ def build_app(card: AgentCard, executor: AgentExecutor) -> Starlette:
         agent_card=card,
     )
     routes = [
-        *create_agent_card_routes(card),          # /.well-known/agent-card.json
+        *create_agent_card_routes(card),  # /.well-known/agent-card.json
         *create_jsonrpc_routes(handler, DEFAULT_RPC_URL),  # JSON-RPC at "/"
     ]
     return Starlette(routes=routes)
@@ -49,7 +51,7 @@ def build_app(card: AgentCard, executor: AgentExecutor) -> Starlette:
 # --------------------------------------------------------------------------- #
 #  Server: LangGraph -> A2A executor with streaming Task lifecycle
 # --------------------------------------------------------------------------- #
-def _summarize_step(node: str, payload: dict) -> str | None:
+def _summarize_step(payload: dict) -> str | None:
     """Map one LangGraph 'updates' chunk to a short human-readable note."""
     msgs = payload.get("messages") if isinstance(payload, dict) else None
     if not msgs:
@@ -65,6 +67,20 @@ def _summarize_step(node: str, payload: dict) -> str | None:
     return None
 
 
+def _is_interrupted(agent, config: dict) -> bool:
+    """True when the graph stopped at an interrupt instead of finishing.
+
+    Only graphs built with a checkpointer (REQUIRE_APPROVAL=1) can interrupt, so
+    that is the condition tested. Deliberately no ``except`` around
+    ``get_state``: swallowing an error here would report "task complete" for a
+    remediation that was interrupted and never ran, which is the exact failure
+    this check exists to prevent. Let it raise and fail the Task instead.
+    """
+    if getattr(agent, "checkpointer", None) is None:
+        return False
+    return bool(agent.get_state(config).next)
+
+
 class LangGraphExecutor(AgentExecutor):
     """Wrap an async LangGraph builder as a streaming A2A AgentExecutor."""
 
@@ -78,28 +94,31 @@ class LangGraphExecutor(AgentExecutor):
         return self._agent
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        agent = await self._ensure()
-
         # The protocol requires the Task to be enqueued before any status event.
         task = context.current_task
         if task is None:
             task = new_task_from_user_message(context.message)
             await event_queue.enqueue_event(task)
         updater = TaskUpdater(event_queue, task.id, task.context_id)
-        await updater.start_work(
-            updater.new_agent_message([Part(text="received request; investigating")])
-        )
 
-        prompt = context.get_user_input()
-        final_text = ""
+        # Everything below runs inside the try: building the agent connects to the
+        # MCP servers and the LLM, and an exception escaping execute() is
+        # serialized into the JSON-RPC error verbatim for the remote caller.
         try:
+            agent = await self._ensure()
+            await updater.start_work(
+                updater.new_agent_message([Part(text="received request; investigating")])
+            )
+
+            config = {"configurable": {"thread_id": context.context_id}}
+            final_text = ""
             async for chunk in agent.astream(
-                {"messages": [{"role": "user", "content": prompt}]},
-                config={"configurable": {"thread_id": context.context_id}},
+                {"messages": [{"role": "user", "content": context.get_user_input()}]},
+                config=config,
                 stream_mode="updates",
             ):
-                for node, payload in chunk.items():
-                    note = _summarize_step(node, payload)
+                for payload in chunk.values():
+                    note = _summarize_step(payload)
                     if note:
                         await updater.update_status(
                             TaskState.TASK_STATE_WORKING,
@@ -108,16 +127,32 @@ class LangGraphExecutor(AgentExecutor):
                     msgs = payload.get("messages") if isinstance(payload, dict) else None
                     if msgs and getattr(msgs[-1], "content", None):
                         final_text = msgs[-1].content
-        except Exception as exc:  # surface failures as a failed Task
-            await updater.failed(
-                updater.new_agent_message([Part(text=f"execution error: {exc}")])
-            )
-            return
 
-        await updater.add_artifact([Part(text=final_text)], name="report")
-        await updater.complete(
-            updater.new_agent_message([Part(text="task complete")])
-        )
+            if _is_interrupted(agent, config):
+                # REQUIRE_APPROVAL=1 stops the graph before the tools node. Saying
+                # "complete" here would report a remediation that never ran.
+                await updater.requires_input(
+                    updater.new_agent_message(
+                        [Part(text="paused for human approval before running any tool")]
+                    )
+                )
+                return
+
+            await updater.add_artifact([Part(text=final_text)], name="report")
+            await updater.complete(updater.new_agent_message([Part(text="task complete")]))
+        except Exception:  # surface failures as a failed Task
+            # The detail stays in this process' logs: the caller is a remote agent,
+            # and raw exception text leaks internal URLs, paths and tool arguments.
+            log.exception("agent execution failed for task %s", task.id)
+            try:
+                await updater.failed(
+                    updater.new_agent_message(
+                        [Part(text=f"execution error; see agent logs for task {task.id}")]
+                    )
+                )
+            except Exception:
+                # The task already reached a terminal state; nothing left to report.
+                log.exception("could not mark task %s failed", task.id)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)

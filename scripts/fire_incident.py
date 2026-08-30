@@ -24,15 +24,17 @@ DEFAULT_PROMPT = "Investigate the active incident and remediate it if it is safe
 async def main() -> None:
     prompt = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROMPT
 
-    # Reset the shared demo state to the seed incident (best-effort; only works
-    # when this process can see the same state file as the MCP servers).
-    try:
-        from mcp_servers import demo_state
+    # Reset the shared demo state to the seed incident. Only works when this
+    # process can see the same state file as the MCP servers - under compose the
+    # file lives on a volume the servers share and this script does not, so a
+    # missing/unwritable path is expected rather than an error.
+    from mcp_servers import demo_state
 
+    try:
         demo_state.reset()
         print("• demo state reset to seed incident (payments-api CrashLoopBackOff)\n")
-    except Exception:
-        pass
+    except OSError as exc:
+        print(f"• skipping demo-state reset ({exc}); the servers keep their own state\n")
 
     print(f"→ sending to Observer: {prompt}\n")
 

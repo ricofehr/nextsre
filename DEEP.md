@@ -104,14 +104,14 @@ The prompt sets three behavioural rules on top of the tool-level harness:
 
 **Layer 1 — MCP tool hard policy** (non-bypassable, lives in the MCP servers, described in detail in the MCP section):
 - `k8s_write.py` checks `ALLOWED_NAMESPACES` and `MAX_REPLICAS` before touching the cluster.
-- `shell_exec.py` validates binary allowlist, substring denylist, and per-binary verb limits.
+- `shell_exec.py` validates the binary allowlist, a position-independent token denylist, and a per-binary verb allowlist pinned to `argv[1]`.
 
 **Layer 2 — Behavioural policy** (system prompt): the rules above guide the LLM toward safe choices before it ever calls a tool.
 
 **Layer 3 — Human approval gate** (optional LangGraph checkpointer):
 
 ```python
-if os.getenv("REQUIRE_APPROVAL") == "1":
+if env_flag("REQUIRE_APPROVAL", default=False):
     graph = create_react_agent(
         llm, tools,
         checkpointer=InMemorySaver(),
@@ -119,7 +119,11 @@ if os.getenv("REQUIRE_APPROVAL") == "1":
     )
 ```
 
-When enabled, the LangGraph graph pauses before every tool node and waits for a human `resume` call. This is the only layer that stops execution _before_ a tool call; layers 1 and 2 operate during or after the LLM's decision.
+When enabled, the graph pauses before every tool node. This is the only layer that stops execution _before_ a tool call; layers 1 and 2 operate during or after the LLM's decision.
+
+`LangGraphExecutor` detects the interrupt (`agent.get_state(config).next` is non-empty) and puts the A2A Task into `TASK_STATE_INPUT_REQUIRED` rather than reporting completion — otherwise the caller would receive a plausible-looking report for a remediation that never ran.
+
+**Known limitation:** resuming an approved task is not implemented. `call_agent` opens a fresh context per call, so there is no channel to continue the checkpointed thread. `REQUIRE_APPROVAL=1` therefore halts remediation rather than gating it.
 
 ### Agent card (`agents/operator/card.py`)
 
@@ -131,9 +135,9 @@ Advertises the `remediate` skill with tags `["sre", "write", "kubernetes"]`. URL
 
 ### What A2A is
 
-A2A (Agent-to-Agent, `a2a-sdk==1.1.0`) is a JSON-RPC-over-HTTP protocol for agents to call other agents as opaque services. An agent publishes an **AgentCard** at `GET /` advertising its skills and transport binding. Callers send tasks via `POST /` using the `message/send` or `message/stream` JSON-RPC method. Responses are streamed as server-sent events carrying `TaskStatusUpdate` and `TaskArtifact` messages until the task reaches a terminal state.
+A2A (Agent-to-Agent, `a2a-sdk==1.1.2`) is a JSON-RPC-over-HTTP protocol for agents to call other agents as opaque services. An agent publishes an **AgentCard** at `GET /` advertising its skills and transport binding. Callers send tasks via `POST /` using the `message/send` or `message/stream` JSON-RPC method. Responses are streamed as server-sent events carrying `TaskStatusUpdate` and `TaskArtifact` messages until the task reaches a terminal state.
 
-**Important version note:** This project uses A2A 1.x, which is proto-based and structurally different from 0.x. `a2a-sdk==1.1.0` is pinned; floating the version will break imports and message shapes.
+**Important version note:** This project uses A2A 1.x, which is proto-based and structurally different from 0.x. `a2a-sdk==1.1.2` is pinned; floating the version will break imports and message shapes.
 
 ### Shared infrastructure (`agents/a2a_app.py`)
 
@@ -236,7 +240,9 @@ graph = create_react_agent(
 )
 ```
 
-`interrupt_before=["tools"]` tells LangGraph to pause the graph just before executing tool calls and persist state in the `InMemorySaver`. A human operator can inspect the pending tool call, then call `graph.invoke(None, config)` to resume (or raise to abort). This is the only mechanism in the system that gives a human veto power over a specific action _after_ the LLM has decided to take it but _before_ it reaches the cluster.
+`interrupt_before=["tools"]` tells LangGraph to pause the graph just before executing tool calls and persist state in the `InMemorySaver`. This is the only mechanism in the system that could give a human veto power over a specific action _after_ the LLM has decided to take it but _before_ it reaches the cluster.
+
+In principle a human inspects the pending tool call and calls `graph.invoke(None, config)` to resume. **That resume path is not wired up here** — see the Known limitation above: `call_agent` opens a fresh context per call, so nothing can continue the checkpointed thread. `REQUIRE_APPROVAL=1` currently halts remediation and reports `TASK_STATE_INPUT_REQUIRED`; it does not gate it.
 
 ---
 
@@ -247,15 +253,21 @@ graph = create_react_agent(
 Each MCP server is a standalone Python module that calls `mcp.server.fastmcp.FastMCP` to register tools and runs a Starlette ASGI app on a dedicated port. All five are built from the same Dockerfile and differ only in their tool definitions and environment configuration.
 
 ```python
-mcp = FastMCP("server-name")
+from common.serving import bind_host, port
+from . import backends
+
+# Loopback by default; compose sets MCP_BIND_HOST=0.0.0.0. Never hardcode the
+# bind address - these servers do not authenticate their callers.
+mcp = FastMCP("server-name", host=bind_host(), port=port(default=PORT))
 
 @mcp.tool()
 def some_tool(arg: str) -> dict:
-    ...
+    """Policy checks and bounds live here; I/O lives in the backend."""
+    return backends.some_domain().some_operation(arg)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=PORT)
+    env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
+    mcp.run(transport="streamable-http")
 ```
 
 ### Demo state (`mcp_servers/demo_state.py`)
@@ -276,11 +288,11 @@ Tools: `list_pods(namespace)`, `get_pod_logs(name, namespace, tail_lines)`, `rec
 
 In demo mode returns `state["alerts"]` filtered by severity and synthesizes metric results from deployment state. In real mode queries the Prometheus Alertmanager REST API (`ALERTMANAGER_URL`) for `active_alerts` and the Prometheus query API (`PROMETHEUS_URL`) for `query_metric`. Severity ordering is numeric (`info=0, warning=1, critical=2`) for `min_severity` filtering.
 
-Tools: `active_alerts(min_severity)`, `query_metric(query, minutes)`.
+Tools: `active_alerts(min_severity)`, `query_metric(query)`.
 
 **`es_logs.py` (port 8103)**
 
-In demo mode synthesizes log entries: healthy deployments emit info messages; unhealthy ones emit OOMKilled errors and crash messages. In real mode issues a `_search` against the `logs-*` index pattern with a `query_string` query bounded by a time range.
+In demo mode synthesizes log entries: healthy deployments emit info messages; unhealthy ones emit OOMKilled errors and crash messages. In real mode issues a `_search` against the `logs-*` index pattern bounded by a time range, using `multi_match` over `["message", "level"]` — deliberately *not* `query_string`, whose operators would let LLM-authored text (derived from attacker-influenceable logs) reach fields this tool must not expose. `""` and `"*"` are special-cased to `match_all`, matching the demo backend. `size` and `minutes` are clamped in `es_logs.py` before the backend is called.
 
 Tool: `search_logs(query, service, minutes, size)`.
 
@@ -288,32 +300,57 @@ Tool: `search_logs(query, service, minutes, size)`.
 
 **`k8s_write.py` (port 8201)**
 
-The harness lives in `_guard_ns(namespace)`:
+The harness lives in `_guard_target(name, namespace)`, which validates both the object
+name and the namespace as RFC 1123 labels and then applies `_guard_ns`:
 
 ```python
-PROTECTED = {"kube-system", "kube-public", "kube-node-lease", "default"}
-ALLOWED   = set(os.getenv("ALLOWED_NAMESPACES", "web,payments,staging").split(","))
+PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "default"}
 
 def _guard_ns(namespace: str) -> None:
-    if namespace in PROTECTED:
-        raise PermissionError(f"{namespace!r} is a protected namespace")
-    if namespace not in ALLOWED:
-        raise PermissionError(f"{namespace!r} not in allowed set {ALLOWED}")
+    _guard_name(namespace, "namespace")
+    if namespace in PROTECTED_NAMESPACES:
+        raise PermissionError(f"namespace '{namespace}' is protected; writes refused")
+    allowed = env_csv("ALLOWED_NAMESPACES", default=DEFAULT_ALLOWED_NAMESPACES)
+    if not allowed:                       # parses empty -> refuse everything
+        raise PermissionError("ALLOWED_NAMESPACES is empty; all writes refused")
+    if namespace not in allowed:
+        raise PermissionError(f"namespace '{namespace}' not in allowlist {sorted(allowed)}")
 ```
 
-`restart_deployment` patches the deployment's `spec.template.metadata.annotations` with a `kubectl.kubernetes.io/restartedAt` timestamp — the standard rolling-restart idiom. `scale_deployment` updates `spec.replicas` after verifying `0 <= replicas <= MAX_REPLICAS`.
+`env_csv` strips whitespace and drops blank entries, so `"web, payments"` works and a
+trailing comma cannot admit the empty namespace. The allowlist is read per call, not
+frozen at import.
+
+`restart_deployment` patches the deployment's `spec.template.metadata.annotations` with an `sre-agent/restartedAt` timestamp — the standard rolling-restart idiom. `scale_deployment` updates `spec.replicas` after verifying `0 <= replicas <= MAX_REPLICAS`.
 
 In demo mode both tools call `demo_state.update()` to mutate shared state without touching a real cluster.
 
 **`shell_exec.py` (port 8202)**
 
-The harness in `_harness_check(command)` works in three passes:
+This is the weakest point of the whole boundary: an under-constrained binary here walks
+around `k8s_write.py` entirely. `_harness_check(command)` works in four passes over the
+`shlex.split` argv — never over the raw string, since quoting and whitespace make
+raw-string matching trivially evadable:
 
-1. Split the command, check `argv[0]` against `ALLOWED_BINARIES`.
-2. Scan the raw command string for `DENY_SUBSTRINGS`.
-3. For `systemctl`, check `argv[1]` against `ALLOWED_SYSTEMCTL_VERBS`.
+1. `argv[0]` must be in `ALLOWED_BINARIES` and must not be path-qualified.
+2. No token may be in `DENIED_TOKENS` — mutating kubectl subcommands (`delete`, `apply`,
+   `exec`, `scale`, …), `secret`/`secrets`, `--raw`, `dump`, and the destructive flags of
+   the binaries that take no verb (`journalctl --vacuum-*`, `ss -K`). Position-independent,
+   and matched with any `=value` suffix stripped.
+3. For binaries in `ALLOWED_VERBS` (`kubectl`, `systemctl`), `argv[1]` must be the verb and
+   must not be a flag. Scanning for "the first non-flag token" is unsafe: kubectl global
+   flags take values, so `kubectl --cache-dir get delete ns kube-system` would present
+   `get` as the verb while kubectl parses `--cache-dir=get` and runs the delete.
+4. `timeout_s` is clamped to 1–60 s; it arrives from an LLM.
 
-Any failure raises `PermissionError` with the reason. Passing commands run via `asyncio.create_subprocess_exec` with a hard `timeout_s` (default 20 s); stdout/stderr are truncated to the last 4000 / 2000 characters.
+Any failure raises `PermissionError` with the reason. Passing commands run via
+`subprocess.run` without a shell and with a minimal `env` (the server's own environment
+holds credentials); stdout/stderr are truncated to the last 4000 / 2000 characters.
+
+`kubectl` is confined to read verbs, so mutations must go through `k8s_write.py` where
+they are guarded and audited. `systemctl restart|reload` is deliberately permitted — host
+service remediation is what the Operator is for — so this is a *non-destructive* allowlist
+rather than a read-only one.
 
 In demo mode the tool returns canned output without executing anything.
 

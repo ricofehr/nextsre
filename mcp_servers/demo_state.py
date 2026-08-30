@@ -19,8 +19,14 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-STATE_FILE = Path(os.environ.get("DEMO_STATE_FILE", "/tmp/sre_demo/cluster_state.json"))
+DEFAULT_STATE_FILE = "/tmp/sre_demo/cluster_state.json"
 _LOCK = threading.Lock()
+
+
+def state_file() -> Path:
+    """Resolved per call, not at import, so the path is never frozen before the
+    environment is set (the servers are imported by tests and entrypoints alike)."""
+    return Path(os.environ.get("DEMO_STATE_FILE", DEFAULT_STATE_FILE))
 
 
 def _seed() -> dict:
@@ -71,23 +77,29 @@ def _seed() -> dict:
 
 def load() -> dict:
     with _LOCK:
-        if not STATE_FILE.exists():
+        path = state_file()
+        if not path.exists():
             _save_unlocked(_seed())
-        return json.loads(STATE_FILE.read_text())
+        return json.loads(path.read_text())
 
 
 def _save_unlocked(state: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(STATE_FILE.parent))
+    path = state_file()
+    # 0700: the default path is a predictable directory under /tmp, and everything
+    # in this file is fed to the Observer's LLM as evidence. A local user who can
+    # write it controls what the agent believes about the incident.
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent))
     with os.fdopen(fd, "w") as fh:
         json.dump(state, fh, indent=2)
-    os.replace(tmp, STATE_FILE)  # atomic
+    os.replace(tmp, path)  # atomic
 
 
 def update(mutator: Callable[[dict], None]) -> dict:
     """Read-modify-write the state under the in-process lock."""
     with _LOCK:
-        state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else _seed()
+        path = state_file()
+        state = json.loads(path.read_text()) if path.exists() else _seed()
         mutator(state)
         _save_unlocked(state)
         return state
@@ -96,5 +108,6 @@ def update(mutator: Callable[[dict], None]) -> dict:
 def reset() -> dict:
     """Restore the seed incident (used by the demo runner)."""
     with _LOCK:
-        _save_unlocked(_seed())
-        return _seed()
+        state = _seed()
+        _save_unlocked(state)
+        return state
