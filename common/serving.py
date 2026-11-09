@@ -31,6 +31,17 @@ def port(*, default: int) -> int:
     return env_int("PORT", default=default)
 
 
+def allowed_hosts(service: str | None = None) -> list[str]:
+    """Hostnames permitted on the HTTP Host header (DNS-rebinding protection).
+
+    ``MCP_ALLOWED_HOSTS`` extends the default loopback list for deployments;
+    each service also accepts its own compose service name so peers can address
+    it on the internal network.
+    """
+    extra = {service} if service else set()
+    return sorted(env_csv("MCP_ALLOWED_HOSTS", default=DEFAULT_ALLOWED_HOSTS) | extra)
+
+
 def transport_security(service: str) -> TransportSecuritySettings:
     """Host/Origin validation for a streamable-http MCP server.
 
@@ -49,7 +60,7 @@ def transport_security(service: str) -> TransportSecuritySettings:
     ``MCP_ALLOWED_HOSTS`` extends the list for deployments (compose adds the
     service name, since peers address each other by it).
     """
-    allowed = env_csv("MCP_ALLOWED_HOSTS", default=DEFAULT_ALLOWED_HOSTS) | {service}
+    allowed = allowed_hosts(service)
     hosts = sorted({entry for host in allowed for entry in (host, f"{host}:*")})
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,

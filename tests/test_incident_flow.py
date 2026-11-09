@@ -145,8 +145,109 @@ def test_a2a_round_trip():
     try:
         _await_card("http://127.0.0.1:9399/.well-known/agent-card.json")
         assert asyncio.run(call_agent("http://127.0.0.1:9399", "hello")) == "echo: hello"
+        # DNS-rebinding Host header must be rejected by TrustedHostMiddleware.
+        rebinding = httpx.get(
+            "http://127.0.0.1:9399/.well-known/agent-card.json",
+            headers={"Host": "evil.attacker.example:9399"},
+            timeout=2,
+        )
+        assert rebinding.status_code == 400
     finally:
         server.should_exit = True
+
+
+def test_executor_ensure_builds_agent_once_under_concurrency():
+    """Concurrent cold-start requests must not build the agent twice."""
+    from agents.a2a_app import LangGraphExecutor
+
+    calls = 0
+
+    async def slow_build():
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.02)
+        return object()
+
+    executor = LangGraphExecutor(slow_build)
+
+    async def run_concurrent():
+        return await asyncio.gather(*(executor._ensure() for _ in range(5)))
+
+    agents = asyncio.run(run_concurrent())
+    assert calls == 1
+    assert len({id(a) for a in agents}) == 1
+
+
+def test_demo_state_creates_lock_and_cleans_up_temp_file_on_error(tmp_path, monkeypatch):
+    """State access creates the companion .lock file and unlinks temp files on replace failure."""
+    import os
+
+    state_path = demo_state.state_file()
+    assert state_path.with_suffix(".json.lock").exists()
+
+    def boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        demo_state.update(lambda s: None)
+
+    leftover_tmps = [
+        p for p in tmp_path.iterdir() if p.name not in {"state.json", "state.json.lock"}
+    ]
+    assert leftover_tmps == []
+
+
+def test_build_react_agent_executes_tool_loop():
+    """build_react_agent runs model -> ToolNode -> model, prepends SystemMessage,
+    and supports interrupt_before."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    from langchain_core.tools import tool
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from common.llm import build_react_agent
+
+    @tool
+    def ping(host: str) -> str:
+        """Return pong for host."""
+        return f"pong:{host}"
+
+    class StubModel:
+        def __init__(self):
+            self.turns = 0
+            self.seen_system: list[str] = []
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            assert isinstance(messages[0], SystemMessage)
+            self.seen_system.append(messages[0].content)
+            self.turns += 1
+            if self.turns == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"id": "call_1", "name": "ping", "args": {"host": "db"}}],
+                )
+            return AIMessage(content=f"done after {messages[-1].content}")
+
+    model = StubModel()
+    graph = build_react_agent(model, [ping], prompt="system rules")
+    out = asyncio.run(graph.ainvoke({"messages": [HumanMessage(content="check db")]}))
+    assert out["messages"][-1].content == "done after pong:db"
+    assert model.seen_system == ["system rules", "system rules"]
+
+    gated = build_react_agent(
+        StubModel(),
+        [ping],
+        prompt="system rules",
+        checkpointer=InMemorySaver(),
+        interrupt_before=["tools"],
+    )
+    cfg = {"configurable": {"thread_id": "t1"}}
+    paused = asyncio.run(gated.ainvoke({"messages": [HumanMessage(content="check db")]}, cfg))
+    assert len(paused["messages"]) == 2
+    assert gated.get_state(cfg).next == ("tools",)
 
 
 def _await_card(url: str, attempts: int = 50) -> None:

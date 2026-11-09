@@ -121,7 +121,7 @@ DENIED_TOKENS = {
     "--cluster",
     "--username",
     "--password",
-    # systemctl mutations outside the verb allowlist, and remote dispatch
+    # systemctl mutations outside the verb allowlist, and remote/root dispatch
     "disable",
     "kill",
     "mask",
@@ -130,7 +130,8 @@ DENIED_TOKENS = {
     "--host",
     "-M",
     "--machine",
-    # journalctl destructive flags (it takes no verb)
+    "--root",
+    # journalctl destructive and arbitrary-path flags (it takes no verb)
     "--vacuum-time",
     "--vacuum-size",
     "--vacuum-files",
@@ -141,6 +142,9 @@ DENIED_TOKENS = {
     "--sync",
     "--update-catalog",
     "--setup-keys",
+    "-D",
+    "--directory",
+    "--file",
 }
 
 # Binaries that take no verb need a flag *allowlist* rather than a denylist:
@@ -174,6 +178,52 @@ ALLOWED_FLAGS = {
         "--extended",
         "--memory",
         "--options",
+    },
+    "df": {
+        "-h",
+        "-m",
+        "-P",
+        "-T",
+        "-i",
+        "-l",
+        "-a",
+        "--human-readable",
+        "--si",
+        "--portability",
+        "--print-type",
+        "--inodes",
+        "--local",
+        "--all",
+        "--total",
+        "--output",
+    },
+    "free": {
+        "-b",
+        "-m",
+        "-g",
+        "-h",
+        "-t",
+        "-w",
+        "--bytes",
+        "--mega",
+        "--giga",
+        "--human",
+        "--total",
+        "--wide",
+        "--si",
+    },
+    "dig": {
+        "-4",
+        "-6",
+        "-x",
+        "-t",
+        "-q",
+    },
+    "uptime": {
+        "-p",
+        "-s",
+        "--pretty",
+        "--since",
     },
 }
 
@@ -223,25 +273,40 @@ def _child_env() -> dict[str, str]:
 def _fragments(token: str) -> list[str]:
     """The parts of a token that must each clear the denylist.
 
-    Drops any ``=value`` suffix (``--vacuum-time=1s``) and splits kubectl resource
-    syntax (``secret/db-creds``, ``pod,secret``, ``secrets.v1.``).
+    Drops any ``=value`` suffix (``--vacuum-time=1s``), extracts the leading
+    short option when a value is attached without a space
+    (``-fhttps://evil/x.yaml``, ``-Huser@remote``, ``-Mother``), and splits
+    kubectl resource syntax (``secret/db-creds``, ``pod,secret``,
+    ``secrets.v1.``).
     """
     base = token.split("=", 1)[0]
     parts = [base]
     for separator in _RESOURCE_SEPARATORS:
         parts = [piece for part in parts for piece in part.split(separator)]
-    return [part for part in parts if part]
+    result = [part for part in parts if part]
+    if base.startswith("-") and not base.startswith("--") and len(base) > 2:
+        result.append(base[:2])
+    return result
+
+
+def _is_short_flag(fragment: str) -> bool:
+    return fragment.startswith("-") and not fragment.startswith("--")
 
 
 def _denied(token: str) -> bool:
     """True if any fragment of ``token`` is denied.
 
-    Matched both as written and case-folded: short flags are case-sensitive
-    (``ss -K`` kills sockets, ``-k`` does not), while subcommands and resource
-    names are conventionally lower-case.
+    Short flags are matched case-sensitively (``-H``/``-M``/``-D`` are remote or
+    directory dispatch, while ``-h``/``-m``/``-d`` are benign formatting flags);
+    long flags, subcommands and resource names are matched both as written and
+    case-folded.
     """
     return any(
-        fragment in DENIED_TOKENS or fragment.lower() in DENIED_TOKENS
+        (
+            fragment in DENIED_TOKENS
+            if _is_short_flag(fragment)
+            else (fragment in DENIED_TOKENS or fragment.lower() in DENIED_TOKENS)
+        )
         for fragment in _fragments(token)
     )
 

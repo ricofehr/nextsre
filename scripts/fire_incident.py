@@ -17,11 +17,12 @@ import sys
 
 from agents.a2a_app import call_agent
 
-OBSERVER_URL = os.environ.get("OBSERVER_URL", "http://localhost:9300")
+DEFAULT_OBSERVER_URL = "http://localhost:9300"
 DEFAULT_PROMPT = "Investigate the active incident and remediate it if it is safe to do so."
 
 
 async def main() -> None:
+    observer_url = os.environ.get("OBSERVER_URL", DEFAULT_OBSERVER_URL)
     prompt = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROMPT
 
     # Reset the seed incident - but only when this process can actually see the
@@ -49,7 +50,7 @@ async def main() -> None:
     def on_status(s: str) -> None:
         print(f"   {s}")
 
-    report = await call_agent(OBSERVER_URL, prompt, on_status=on_status)
+    report = await call_agent(observer_url, prompt, on_status=on_status)
     print("\n================ INCIDENT REPORT ================\n")
     print(report)
 

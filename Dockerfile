@@ -1,18 +1,21 @@
 # Single image shared by all 7 services; the compose file picks the command.
 FROM python:3.12-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # Install dependencies first for better layer caching.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --upgrade --upgrade-strategy eager .
 
 # Now the source.
 COPY common ./common
 COPY mcp_servers ./mcp_servers
 COPY agents ./agents
 COPY scripts ./scripts
-COPY tests ./tests
 
 # Re-install so the package metadata matches the copied source.
 RUN pip install --no-cache-dir --no-deps .

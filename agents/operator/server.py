@@ -5,7 +5,7 @@ from agents.operator.card import operator_card
 from agents.operator.operator_agent import build_operator
 from common.serving import bind_host, port
 
-app = build_app(operator_card(), LangGraphExecutor(build_operator))
+app = build_app(operator_card(), LangGraphExecutor(build_operator), service="operator")
 
 if __name__ == "__main__":
     # Loopback by default. This is the write agent: anything that can reach it

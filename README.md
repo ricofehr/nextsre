@@ -168,11 +168,13 @@ authorization model:
   that can open a socket to `shell-exec:8202` gets command execution.
 - Host/Origin validation is **on**. `FastMCP` treats an unset `transport_security`
   as "DNS-rebinding protection off" — the inverse of the library's own default —
-  so every server passes it explicitly. Without it, a browser on a machine running
-  these servers can be steered to the tool surface by an attacker domain that
-  re-resolves to `127.0.0.1`: same-origin as far as CORS is concerned, so the
+  so every MCP server passes it explicitly, and `build_app` wraps both A2A agent
+  servers in `TrustedHostMiddleware`. Without it, a browser on a machine running
+  these servers can be steered to the tool or agent surface by an attacker domain
+  that re-resolves to `127.0.0.1`: same-origin as far as CORS is concerned, so the
   Host check is the only thing standing in the way. Extend with `MCP_ALLOWED_HOSTS`.
-- Containers run as a non-root user.
+- Containers run as a non-root user with a read-only root filesystem (`read_only: true`,
+  `no-new-privileges:true`, and `/tmp` on `tmpfs`).
 
 **Residual risk, accepted for a demo:**
 
@@ -213,8 +215,8 @@ your second line, RBAC is your first.
   `Task` must be enqueued before any status event. All handled in `a2a_app.py`.
 - Runtime versions are pinned exactly in `pyproject.toml` for that reason. The
   optional `real` extra is version-ranged, not pinned.
-- `mcp` stays on 1.x: `langchain-mcp-adapters` requires `mcp<2.0.0`, and 2.x
-  renames `FastMCP` to `MCPServer`. The pin clears PYSEC-2026-3483, which affects
-  the deprecated websocket transport this repo does not use.
+- `mcp` stays on 1.x (`1.30.0`): `langchain-mcp-adapters` requires `mcp<2.0.0`,
+  and 2.x renames `FastMCP` to `MCPServer`. The pin clears PYSEC-2026-3483 and
+  CVE-2026-59951 / CVE-2026-116684..116686.
 - The demo state file is last-write-wins across processes — fine for a demo,
   not a datastore.
