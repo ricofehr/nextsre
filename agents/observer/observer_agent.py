@@ -8,22 +8,34 @@ from __future__ import annotations
 import os
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
 
 from agents.observer.remediation_tool import request_remediation
-from common.llm import local_llm
+from common.llm import build_react_agent, local_llm
 
-K8S_RO_URL = os.environ.get("K8S_RO_URL", "http://localhost:8101/mcp")
-PROMETHEUS_ALERTS_URL = os.environ.get("PROMETHEUS_ALERTS_URL", "http://localhost:8102/mcp")
-ES_LOGS_URL = os.environ.get("ES_LOGS_URL", "http://localhost:8103/mcp")
+DEFAULT_K8S_RO_URL = "http://localhost:8101/mcp"
+DEFAULT_PROMETHEUS_ALERTS_URL = "http://localhost:8102/mcp"
+DEFAULT_ES_LOGS_URL = "http://localhost:8103/mcp"
 
-_mcp = MultiServerMCPClient(
-    {
-        "k8s_ro": {"transport": "streamable_http", "url": K8S_RO_URL},
-        "prometheus_alerts": {"transport": "streamable_http", "url": PROMETHEUS_ALERTS_URL},
-        "es_logs": {"transport": "streamable_http", "url": ES_LOGS_URL},
-    }
-)
+
+def _mcp_client() -> MultiServerMCPClient:
+    """Build the MCP client from current environment variables (not frozen at import)."""
+    return MultiServerMCPClient(
+        {
+            "k8s_ro": {
+                "transport": "streamable_http",
+                "url": os.environ.get("K8S_RO_URL", DEFAULT_K8S_RO_URL),
+            },
+            "prometheus_alerts": {
+                "transport": "streamable_http",
+                "url": os.environ.get("PROMETHEUS_ALERTS_URL", DEFAULT_PROMETHEUS_ALERTS_URL),
+            },
+            "es_logs": {
+                "transport": "streamable_http",
+                "url": os.environ.get("ES_LOGS_URL", DEFAULT_ES_LOGS_URL),
+            },
+        }
+    )
+
 
 SYSTEM = """You are an SRE observability agent. You can ONLY read - cluster
 state, Prometheus alerts, and logs. Investigate the reported incident:
@@ -48,5 +60,5 @@ End with a short incident report: symptom, root cause, action taken, outcome."""
 
 
 async def build_observer():
-    read_tools = await _mcp.get_tools()
-    return create_react_agent(local_llm(), [*read_tools, request_remediation], prompt=SYSTEM)
+    read_tools = await _mcp_client().get_tools()
+    return build_react_agent(local_llm(), [*read_tools, request_remediation], prompt=SYSTEM)

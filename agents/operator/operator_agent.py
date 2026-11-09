@@ -14,20 +14,29 @@ import os
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.prebuilt import create_react_agent
 
 from common.env import env_flag
-from common.llm import local_llm
+from common.llm import build_react_agent, local_llm
 
-K8S_WRITE_URL = os.environ.get("K8S_WRITE_URL", "http://localhost:8201/mcp")
-SHELL_URL = os.environ.get("SHELL_URL", "http://localhost:8202/mcp")
+DEFAULT_K8S_WRITE_URL = "http://localhost:8201/mcp"
+DEFAULT_SHELL_URL = "http://localhost:8202/mcp"
 
-_mcp = MultiServerMCPClient(
-    {
-        "k8s_write": {"transport": "streamable_http", "url": K8S_WRITE_URL},
-        "shell": {"transport": "streamable_http", "url": SHELL_URL},
-    }
-)
+
+def _mcp_client() -> MultiServerMCPClient:
+    """Build the MCP client from current environment variables (not frozen at import)."""
+    return MultiServerMCPClient(
+        {
+            "k8s_write": {
+                "transport": "streamable_http",
+                "url": os.environ.get("K8S_WRITE_URL", DEFAULT_K8S_WRITE_URL),
+            },
+            "shell": {
+                "transport": "streamable_http",
+                "url": os.environ.get("SHELL_URL", DEFAULT_SHELL_URL),
+            },
+        }
+    )
+
 
 SYSTEM = """You are an SRE operator agent with WRITE access to a Kubernetes
 cluster and a set of hosts. You act on a request from another agent - treat
@@ -44,9 +53,9 @@ Rules:
 
 
 async def build_operator():
-    tools = await _mcp.get_tools()
+    tools = await _mcp_client().get_tools()
     kwargs = {}
     if env_flag("REQUIRE_APPROVAL", default=False):
         # Pause before any tool executes; a human resumes via a follow-up turn.
         kwargs = {"checkpointer": InMemorySaver(), "interrupt_before": ["tools"]}
-    return create_react_agent(local_llm(), tools, prompt=SYSTEM, **kwargs)
+    return build_react_agent(local_llm(), tools, prompt=SYSTEM, **kwargs)

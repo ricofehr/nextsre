@@ -11,6 +11,7 @@ Not exercised by the offline test suite - these paths need live infrastructure.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import httpx
@@ -21,15 +22,17 @@ _HTTP_TIMEOUT = 10
 _MATCH_ALL = ("", "*")
 
 
+@contextmanager
 def _kube_api():  # pragma: no cover - needs a live cluster
-    """Load in-cluster credentials, falling back to a local kubeconfig."""
+    """Load in-cluster credentials (or local kubeconfig) with a managed ApiClient."""
     from kubernetes import client, config
 
     try:
         config.load_incluster_config()
     except config.ConfigException:
         config.load_kube_config()
-    return client.CoreV1Api(), client.AppsV1Api()
+    with client.ApiClient() as api_client:
+        yield client.CoreV1Api(api_client), client.AppsV1Api(api_client)
 
 
 def _waiting_reason(statuses) -> str:  # pragma: no cover - needs a live cluster
@@ -58,9 +61,10 @@ def _checked_url(name: str, default: str) -> str:
 
 class RealK8sRead:  # pragma: no cover - needs a live cluster
     def list_pods(self, namespace: str) -> list[dict]:
-        core, _ = _kube_api()
+        with _kube_api() as (core, _):
+            items = core.list_namespaced_pod(namespace).items
         pods = []
-        for pod in core.list_namespaced_pod(namespace).items:
+        for pod in items:
             statuses = pod.status.container_statuses or []
             pods.append(
                 {
@@ -75,12 +79,12 @@ class RealK8sRead:  # pragma: no cover - needs a live cluster
         return pods
 
     def pod_logs(self, name: str, namespace: str, tail_lines: int) -> str:
-        core, _ = _kube_api()
-        return core.read_namespaced_pod_log(name, namespace, tail_lines=tail_lines)
+        with _kube_api() as (core, _):
+            return core.read_namespaced_pod_log(name, namespace, tail_lines=tail_lines)
 
     def warning_events(self, namespace: str, limit: int) -> list[dict]:
-        core, _ = _kube_api()
-        events = [e for e in core.list_namespaced_event(namespace).items if e.type == "Warning"]
+        with _kube_api() as (core, _):
+            events = [e for e in core.list_namespaced_event(namespace).items if e.type == "Warning"]
         return [
             {"reason": e.reason, "object": e.involved_object.name, "message": e.message}
             for e in events[-limit:]
@@ -89,11 +93,11 @@ class RealK8sRead:  # pragma: no cover - needs a live cluster
 
 class RealK8sWrite:  # pragma: no cover - needs a live cluster
     def restart_deployment(self, name: str, namespace: str, stamp: str) -> dict:
-        _, apps = _kube_api()
         patch = {
             "spec": {"template": {"metadata": {"annotations": {"sre-agent/restartedAt": stamp}}}}
         }
-        apps.patch_namespaced_deployment(name, namespace, patch)
+        with _kube_api() as (_, apps):
+            apps.patch_namespaced_deployment(name, namespace, patch)
         return {
             "action": "restart_deployment",
             "name": name,
@@ -103,8 +107,10 @@ class RealK8sWrite:  # pragma: no cover - needs a live cluster
         }
 
     def scale_deployment(self, name: str, namespace: str, replicas: int) -> dict:
-        _, apps = _kube_api()
-        apps.patch_namespaced_deployment_scale(name, namespace, {"spec": {"replicas": replicas}})
+        with _kube_api() as (_, apps):
+            apps.patch_namespaced_deployment_scale(
+                name, namespace, {"spec": {"replicas": replicas}}
+            )
         return {
             "action": "scale_deployment",
             "name": name,
@@ -156,7 +162,6 @@ class RealLogs:  # pragma: no cover - needs a live Elasticsearch
     def search(self, query: str, service: str | None, minutes: int, size: int) -> list[dict]:
         from elasticsearch import Elasticsearch
 
-        es = Elasticsearch(_checked_url("ES_URL", "http://elasticsearch:9200"))
         filters: list[dict] = [{"range": {"@timestamp": {"gte": f"now-{minutes}m"}}}]
         if service:
             filters.append({"term": {"service.keyword": service}})
@@ -169,10 +174,11 @@ class RealLogs:  # pragma: no cover - needs a live Elasticsearch
             must: dict = {"match_all": {}}
         else:
             must = {"multi_match": {"query": query, "fields": ["message", "level"]}}
-        hits = es.search(
-            index="logs-*",
-            size=size,
-            sort=[{"@timestamp": "desc"}],
-            query={"bool": {"must": [must], "filter": filters}},
-        )["hits"]["hits"]
+        with Elasticsearch(_checked_url("ES_URL", "http://elasticsearch:9200")) as es:
+            hits = es.search(
+                index="logs-*",
+                size=size,
+                sort=[{"@timestamp": "desc"}],
+                query={"bool": {"must": [must], "filter": filters}},
+            )["hits"]["hits"]
         return [hit["_source"] for hit in hits]

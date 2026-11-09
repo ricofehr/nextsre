@@ -22,17 +22,22 @@ def _connection_urls(client) -> str:
 
 
 def test_observer_is_not_wired_to_any_write_server():
-    urls = _connection_urls(observer_agent._mcp)
+    client = observer_agent._mcp_client()
+    urls = _connection_urls(client)
     assert "8201" not in urls and "8202" not in urls, urls
-    assert "k8s_write" not in urls and "shell" not in observer_agent._mcp.connections
+    assert "k8s_write" not in urls and "shell" not in client.connections
 
 
 def test_observer_reaches_all_three_read_servers():
-    assert set(observer_agent._mcp.connections) == {"k8s_ro", "prometheus_alerts", "es_logs"}
+    assert set(observer_agent._mcp_client().connections) == {
+        "k8s_ro",
+        "prometheus_alerts",
+        "es_logs",
+    }
 
 
 def test_operator_holds_the_write_servers():
-    assert set(operator_agent._mcp.connections) == {"k8s_write", "shell"}
+    assert set(operator_agent._mcp_client().connections) == {"k8s_write", "shell"}
 
 
 def test_remediation_tool_is_the_observers_only_route_to_change():
@@ -48,3 +53,16 @@ def test_write_tools_live_only_behind_the_operators_servers():
     cannot quietly pass because a rename made the assertions vacuous."""
     assert {"restart_deployment", "scale_deployment"} <= set(dir(k8s_write))
     assert "run_command" in dir(shell_exec)
+
+
+def test_agent_urls_are_resolved_at_call_time(monkeypatch):
+    """regression: MCP and Operator URLs were frozen at module import time."""
+    from agents.observer import remediation_tool
+
+    monkeypatch.setenv("K8S_RO_URL", "http://custom-k8s-ro:8101/mcp")
+    monkeypatch.setenv("K8S_WRITE_URL", "http://custom-k8s-write:8201/mcp")
+    monkeypatch.setenv("OPERATOR_URL", "http://custom-operator:9301")
+
+    assert "custom-k8s-ro" in _connection_urls(observer_agent._mcp_client())
+    assert "custom-k8s-write" in _connection_urls(operator_agent._mcp_client())
+    assert remediation_tool._operator_url() == "http://custom-operator:9301"

@@ -27,22 +27,32 @@ x-host: &host-gateway
   extra_hosts:
     - "host.docker.internal:host-gateway"
 
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+
 services:
   # ---- read-only MCP servers (Observer's tools) ----
   k8s-ro:
     build: .
+    <<: *hardening
     command: python -m mcp_servers.k8s_readonly
     environment: { <<: *demo-env, PORT: "8101" }
     volumes: [ "cluster-state:/data" ]
 
   prometheus-alerts:
     build: .
+    <<: *hardening
     command: python -m mcp_servers.prometheus_alerts
     environment: { <<: *demo-env, PORT: "8102" }
     volumes: [ "cluster-state:/data" ]
 
   es-logs:
     build: .
+    <<: *hardening
     command: python -m mcp_servers.es_logs
     environment: { <<: *demo-env, PORT: "8103" }
     volumes: [ "cluster-state:/data" ]
@@ -50,6 +60,7 @@ services:
   # ---- write MCP servers (Operator's tools) ----
   k8s-write:
     build: .
+    <<: *hardening
     command: python -m mcp_servers.k8s_write
     environment:
       <<: *demo-env
@@ -60,6 +71,7 @@ services:
 
   shell-exec:
     build: .
+    <<: *hardening
     command: python -m mcp_servers.shell_exec
     environment: { <<: *demo-env, PORT: "8202" }
     volumes: [ "cluster-state:/data" ]
@@ -68,7 +80,7 @@ services:
   operator:
     build: .
     command: python -m agents.operator.server
-    <<: *host-gateway
+    <<: [ *host-gateway, *hardening ]
     environment:
       <<: [ *llm-env, *demo-env ]
       PORT: "9301"
@@ -83,7 +95,7 @@ services:
   observer:
     build: .
     command: python -m agents.observer.server
-    <<: *host-gateway
+    <<: [ *host-gateway, *hardening ]
     environment:
       <<: [ *llm-env, *demo-env ]
       PORT: "9300"

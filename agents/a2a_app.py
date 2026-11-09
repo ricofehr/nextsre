@@ -11,8 +11,10 @@ Contains:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
+from urllib.parse import urlparse
 
 import httpx
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
@@ -26,8 +28,11 @@ from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
 from a2a.types import AgentCard, Part, TaskState
 from a2a.utils import DEFAULT_RPC_URL
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from common.a2a_helpers import render_event, user_text_request
+from common.serving import allowed_hosts
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +40,12 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 #  Server: turn a (card, executor) pair into a runnable ASGI app
 # --------------------------------------------------------------------------- #
-def build_app(card: AgentCard, executor: AgentExecutor) -> Starlette:
+def build_app(
+    card: AgentCard,
+    executor: AgentExecutor,
+    *,
+    service: str | None = None,
+) -> Starlette:
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
@@ -45,7 +55,14 @@ def build_app(card: AgentCard, executor: AgentExecutor) -> Starlette:
         *create_agent_card_routes(card),  # /.well-known/agent-card.json
         *create_jsonrpc_routes(handler, DEFAULT_RPC_URL),  # JSON-RPC at "/"
     ]
-    return Starlette(routes=routes)
+    card_hosts = {
+        urlparse(iface.url).hostname
+        for iface in card.supported_interfaces
+        if iface.url and urlparse(iface.url).hostname
+    }
+    hosts = sorted(set(allowed_hosts(service)) | card_hosts)
+    middleware = [Middleware(TrustedHostMiddleware, allowed_hosts=hosts)]
+    return Starlette(routes=routes, middleware=middleware)
 
 
 # --------------------------------------------------------------------------- #
@@ -87,10 +104,13 @@ class LangGraphExecutor(AgentExecutor):
     def __init__(self, build_agent: Callable[[], Awaitable]):
         self._build = build_agent
         self._agent = None
+        self._lock = asyncio.Lock()
 
     async def _ensure(self):
         if self._agent is None:
-            self._agent = await self._build()
+            async with self._lock:
+                if self._agent is None:
+                    self._agent = await self._build()
         return self._agent
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:

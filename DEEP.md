@@ -75,7 +75,7 @@ The Observer never sees write MCP tools. Its tool list at runtime is exactly the
 
 ### Agent card (`agents/observer/card.py`)
 
-Advertises the `investigate` skill with tags `["sre", "read-only", "diagnosis"]`. The card is served at `GET /` on the agent's HTTP port and is the entry point for A2A service discovery.
+Advertises the `investigate` skill with tags `["sre", "read-only", "diagnosis"]`. The card is served at `GET /.well-known/agent-card.json` on the agent's HTTP port and is the entry point for A2A service discovery.
 
 ---
 
@@ -112,8 +112,9 @@ The prompt sets three behavioural rules on top of the tool-level harness:
 
 ```python
 if env_flag("REQUIRE_APPROVAL", default=False):
-    graph = create_react_agent(
+    graph = build_react_agent(
         llm, tools,
+        prompt=SYSTEM,
         checkpointer=InMemorySaver(),
         interrupt_before=["tools"],
     )
@@ -135,41 +136,45 @@ Advertises the `remediate` skill with tags `["sre", "write", "kubernetes"]`. URL
 
 ### What A2A is
 
-A2A (Agent-to-Agent, `a2a-sdk==1.1.2`) is a JSON-RPC-over-HTTP protocol for agents to call other agents as opaque services. An agent publishes an **AgentCard** at `GET /` advertising its skills and transport binding. Callers send tasks via `POST /` using the `message/send` or `message/stream` JSON-RPC method. Responses are streamed as server-sent events carrying `TaskStatusUpdate` and `TaskArtifact` messages until the task reaches a terminal state.
+A2A (Agent-to-Agent, `a2a-sdk==1.3.0`) is a JSON-RPC-over-HTTP protocol for agents to call other agents as opaque services. An agent publishes an **AgentCard** at `GET /.well-known/agent-card.json` advertising its skills and transport binding. Callers send tasks via `POST /` using the `message/send` or `message/stream` JSON-RPC method. Responses are streamed as server-sent events carrying `TaskStatusUpdate` and `TaskArtifact` messages until the task reaches a terminal state.
 
-**Important version note:** This project uses A2A 1.x, which is proto-based and structurally different from 0.x. `a2a-sdk==1.1.2` is pinned; floating the version will break imports and message shapes.
+**Important version note:** This project uses A2A 1.x, which is proto-based and structurally different from 0.x. `a2a-sdk==1.3.0` is pinned; floating the version will break imports and message shapes.
 
 ### Shared infrastructure (`agents/a2a_app.py`)
 
-#### `build_app(card, executor) -> Starlette`
+#### `build_app(card, executor, *, service=None) -> Starlette`
 
-Creates the ASGI application used by both agents. Mounts the A2A JSON-RPC handler and serves the agent card on `GET /`. Both `observer/server.py` and `operator/server.py` call this with their own card and executor and pass the result to `uvicorn.run`.
+Creates the ASGI application used by both agents. Mounts the A2A JSON-RPC handler at `POST /`, serves the agent card on `GET /.well-known/agent-card.json`, and wraps the app in `TrustedHostMiddleware` (DNS-rebinding protection). Both `observer/server.py` and `operator/server.py` call this with their own card and executor and pass the result to `uvicorn.run`.
 
 #### `LangGraphExecutor`
 
-Bridges a LangGraph `CompiledGraph` to the `AgentExecutor` interface expected by the A2A SDK.
+Bridges a LangGraph `CompiledStateGraph` to the `AgentExecutor` interface expected by the A2A SDK.
 
 ```python
 class LangGraphExecutor(AgentExecutor):
     def __init__(self, build_agent: Callable[[], Awaitable]):
         self._build = build_agent
         self._agent = None
+        self._lock = asyncio.Lock()
 
     async def _ensure(self):
         if self._agent is None:
-            self._agent = await self._build()
+            async with self._lock:
+                if self._agent is None:
+                    self._agent = await self._build()
+        return self._agent
 
     async def execute(self, context: RequestContext, event_queue: EventQueue):
-        await self._ensure()
+        agent = await self._ensure()
         # streams LangGraph node updates as TaskStatusUpdate events
         # final response becomes a TaskArtifact
 ```
 
-The executor lazily builds the agent on first call (so MCP server connections are established after the HTTP server is already listening). It iterates `agent.astream_events`, translates each LangGraph node update to a human-readable status string via `_summarize_step`, enqueues those as `TaskStatusUpdate`, and enqueues the last message content as a `TaskArtifact` when the graph terminates.
+The executor lazily builds the agent on first call under an `asyncio.Lock` (so MCP server connections are established once after the HTTP server is already listening). It iterates `agent.astream(..., stream_mode="updates")`, translates each LangGraph node update to a human-readable status string via `_summarize_step`, enqueues those as `TaskStatusUpdate`, and enqueues the last message content as a `TaskArtifact` when the graph terminates.
 
-`_summarize_step` maps LangGraph node names to status strings:
-- `"agent"` node → `"Thinking…"`
-- `"tools"` node → extracts tool call name, e.g. `"Calling list_pods…"`
+`_summarize_step` maps LangGraph node updates to status strings:
+- tool calls emitted → `"calling tools: <names>"`
+- `ToolMessage` returned → `"tool '<name>' returned"`
 
 #### `call_agent(base_url, text, *, on_status, timeout) -> str`
 
@@ -178,12 +183,12 @@ The A2A client used by `request_remediation` and `fire_incident.py`. Sends a `Se
 ```python
 async def call_agent(base_url, text, *, on_status=None, timeout=180) -> str:
     req = user_text_request(text)          # wraps in A2A envelope
-    async for event in client.send_message_streaming(req):
-        kind, text = render_event(event)
+    async for event in client.send_message(req):
+        kind, value = render_event(event)
         if kind == "status" and on_status:
-            on_status(text)
+            on_status(value)
         elif kind == "artifact":
-            return text
+            artifact_text = value
 ```
 
 ### Message helpers (`common/a2a_helpers.py`)
@@ -212,29 +217,27 @@ def local_llm(model: str | None = None) -> ChatOpenAI:
 
 ### ReAct agent construction
 
-Both agents are built with `create_react_agent` from `langgraph.prebuilt`:
+Both agents are built with `build_react_agent` from `common/llm.py` (which compiles a two-node `StateGraph(MessagesState)` over `ToolNode` and `tools_condition`, avoiding the deprecated `langgraph.prebuilt.create_react_agent`):
 
 ```python
-llm = local_llm()
-async with MultiServerMCPClient(mcp_servers) as mcp:
-    tools = mcp.get_tools()
-    agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
-    return agent
+tools = await _mcp_client().get_tools()
+agent = build_react_agent(local_llm(), tools, prompt=SYSTEM)
 ```
 
-`create_react_agent` compiles a LangGraph `StateGraph` with two nodes: `"agent"` (calls the LLM with the current message list) and `"tools"` (executes the tool calls the LLM returned). The graph loops until the LLM emits a message with no tool calls.
+`build_react_agent` compiles a LangGraph `StateGraph` with two nodes: `"agent"` (calls the LLM with the system prompt + current message list) and `"tools"` (executes the tool calls the LLM returned). The graph loops until the LLM emits a message with no tool calls.
 
 ### Tool loading via `MultiServerMCPClient`
 
-`langchain-mcp-adapters==0.3.0` provides `MultiServerMCPClient`, which connects to multiple MCP HTTP endpoints and exposes all their tools as LangChain `BaseTool` objects. Each tool is described by the MCP server's tool schema; the LLM sees the tool name, description, and JSON Schema for its arguments. The client manages the persistent HTTP/SSE connections to each MCP server for the lifetime of the `async with` block.
+`langchain-mcp-adapters==0.3.2` provides `MultiServerMCPClient`, which connects to multiple MCP HTTP endpoints (`streamable_http` transport) and exposes all their tools as LangChain `BaseTool` objects via `await client.get_tools()`. Each tool is described by the MCP server's tool schema; the LLM sees the tool name, description, and JSON Schema for its arguments.
 
 ### The checkpointer and interrupt pattern (Operator only)
 
 When `REQUIRE_APPROVAL=1`:
 
 ```python
-graph = create_react_agent(
+graph = build_react_agent(
     llm, tools,
+    prompt=SYSTEM,
     checkpointer=InMemorySaver(),
     interrupt_before=["tools"],
 )
@@ -253,12 +256,17 @@ In principle a human inspects the pending tool call and calls `graph.invoke(None
 Each MCP server is a standalone Python module that calls `mcp.server.fastmcp.FastMCP` to register tools and runs a Starlette ASGI app on a dedicated port. All five are built from the same Dockerfile and differ only in their tool definitions and environment configuration.
 
 ```python
-from common.serving import bind_host, port
+from common.serving import bind_host, port, transport_security
 from . import backends
 
 # Loopback by default; compose sets MCP_BIND_HOST=0.0.0.0. Never hardcode the
 # bind address - these servers do not authenticate their callers.
-mcp = FastMCP("server-name", host=bind_host(), port=port(default=PORT))
+mcp = FastMCP(
+    "server-name",
+    host=bind_host(),
+    port=port(default=PORT),
+    transport_security=transport_security("server-name"),
+)
 
 @mcp.tool()
 def some_tool(arg: str) -> dict:
@@ -272,7 +280,7 @@ if __name__ == "__main__":
 
 ### Demo state (`mcp_servers/demo_state.py`)
 
-The synthetic cluster is a single JSON file shared across all five MCP server processes via `DEMO_STATE_FILE`. Reads and writes go through `load()` and `update(mutator)` which acquire a `threading.Lock` and write atomically via `tempfile + os.replace` to avoid partial reads.
+The synthetic cluster is a single JSON file shared across all five MCP server processes via `DEMO_STATE_FILE`. Reads and writes go through `load()` and `update(mutator)` which acquire both an in-process `threading.Lock` and an advisory cross-process `fcntl.flock` lock file, writing atomically via `tempfile + os.replace` to avoid partial reads or lost updates.
 
 The seed state encodes a real-looking incident: `payments-api` in `CrashLoopBackOff` with 47 restarts and `OOMKilled` as the last error, plus a critical alert and a DB connection pool saturation warning. When `restart_deployment` runs in demo mode it calls `update()` to flip `healthy=True` and clear `reason` and `last_error` — the read tools will then report a healthy deployment, confirming recovery.
 
@@ -323,27 +331,31 @@ def _guard_ns(namespace: str) -> None:
 trailing comma cannot admit the empty namespace. The allowlist is read per call, not
 frozen at import.
 
-`restart_deployment` patches the deployment's `spec.template.metadata.annotations` with an `sre-agent/restartedAt` timestamp — the standard rolling-restart idiom. `scale_deployment` updates `spec.replicas` after verifying `0 <= replicas <= MAX_REPLICAS`.
+`restart_deployment` patches the deployment's `spec.template.metadata.annotations` with an `sre-agent/restartedAt` timestamp — the standard rolling-restart idiom. `scale_deployment` updates `spec.replicas` after verifying `1 <= replicas <= MAX_REPLICAS` (or `0 <= replicas <= MAX_REPLICAS` when `ALLOW_SCALE_TO_ZERO=1` is explicitly set).
 
 In demo mode both tools call `demo_state.update()` to mutate shared state without touching a real cluster.
 
 **`shell_exec.py` (port 8202)**
 
 This is the weakest point of the whole boundary: an under-constrained binary here walks
-around `k8s_write.py` entirely. `_harness_check(command)` works in four passes over the
+around `k8s_write.py` entirely. `_harness_check(command)` works in five passes over the
 `shlex.split` argv — never over the raw string, since quoting and whitespace make
 raw-string matching trivially evadable:
 
 1. `argv[0]` must be in `ALLOWED_BINARIES` and must not be path-qualified.
-2. No token may be in `DENIED_TOKENS` — mutating kubectl subcommands (`delete`, `apply`,
-   `exec`, `scale`, …), `secret`/`secrets`, `--raw`, `dump`, and the destructive flags of
-   the binaries that take no verb (`journalctl --vacuum-*`, `ss -K`). Position-independent,
-   and matched with any `=value` suffix stripped.
+2. No token may match `DENIED_TOKENS` — mutating kubectl subcommands (`delete`, `apply`,
+   `exec`, `scale`, …), `secret`/`secrets`, `--raw`, `dump`, `-f`/`-k` (including attached
+   values like `-fhttps://...`), remote/root systemctl flags (`-H`, `-M`, `--root`,
+   including `-Huser@remote`), and destructive/path journalctl flags (`--vacuum-*`,
+   `--rotate`, `-D`, `--directory`, `--file`). Position-independent, with `=value`
+   stripped, leading short flags extracted, and resource separators (`/`, `,`, `.`) split.
 3. For binaries in `ALLOWED_VERBS` (`kubectl`, `systemctl`), `argv[1]` must be the verb and
    must not be a flag. Scanning for "the first non-flag token" is unsafe: kubectl global
    flags take values, so `kubectl --cache-dir get delete ns kube-system` would present
    `get` as the verb while kubectl parses `--cache-dir=get` and runs the delete.
-4. `timeout_s` is clamped to 1–60 s; it arrives from an LLM.
+4. For verb-less binaries in `ALLOWED_FLAGS` (`ss`, `df`, `free`, `dig`, `uptime`), every
+   flag (with clustered short flags expanded) must appear on that binary's allowlist.
+5. `timeout_s` is clamped to 1–60 s; it arrives from an LLM.
 
 Any failure raises `PermissionError` with the reason. Passing commands run via
 `subprocess.run` without a shell and with a minimal `env` (the server's own environment
