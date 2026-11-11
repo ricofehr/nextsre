@@ -157,8 +157,19 @@ def test_a2a_round_trip():
 
 
 def test_executor_ensure_builds_agent_once_under_concurrency():
-    """Concurrent cold-start requests must not build the agent twice."""
-    from agents.a2a_app import LangGraphExecutor
+    """Concurrent cold-start requests must not build the agent or runner twice."""
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_request import LlmRequest
+
+    from agents.a2a_app import ADKExecutor
+
+    class IdleLlm(BaseLlm):
+        model: str = "idle"
+
+        async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False):
+            return
+            yield
 
     calls = 0
 
@@ -166,16 +177,118 @@ def test_executor_ensure_builds_agent_once_under_concurrency():
         nonlocal calls
         calls += 1
         await asyncio.sleep(0.02)
-        return object()
+        return LlmAgent(name="test_agent", model=IdleLlm(), instruction="noop")
 
-    executor = LangGraphExecutor(slow_build)
+    executor = ADKExecutor(slow_build)
 
     async def run_concurrent():
-        return await asyncio.gather(*(executor._ensure() for _ in range(5)))
+        return await asyncio.gather(*(executor._ensure_runner() for _ in range(5)))
 
-    agents = asyncio.run(run_concurrent())
+    runners = asyncio.run(run_concurrent())
     assert calls == 1
-    assert len({id(a) for a in agents}) == 1
+    assert len({id(r) for r in runners}) == 1
+
+
+def test_adk_executor_sanitizes_internal_errors():
+    """ADKExecutor must not leak raw exception messages or internal URLs on failure."""
+    from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+    from a2a.utils import TransportProtocol
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_request import LlmRequest
+
+    from agents.a2a_app import ADKExecutor, build_app, call_agent
+
+    class FailingLlm(BaseLlm):
+        model: str = "failing"
+
+        async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False):
+            raise RuntimeError("secret internal url http://10.0.0.99:8201/mcp failed")
+            yield
+
+    def build_failing():
+        return LlmAgent(name="failing_agent", model=FailingLlm(), instruction="fail")
+
+    card = AgentCard(
+        name="Failing",
+        description="test",
+        version="1.0.0",
+        default_input_modes=["text/plain"],
+        default_output_modes=["text/plain"],
+        capabilities=AgentCapabilities(streaming=True),
+        supported_interfaces=[
+            AgentInterface(url="http://127.0.0.1:9397", protocol_binding=TransportProtocol.JSONRPC)
+        ],
+        skills=[AgentSkill(id="fail", name="Fail", description="fail", tags=["t"])],
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            build_app(card, ADKExecutor(build_failing)),
+            host="127.0.0.1",
+            port=9397,
+            log_level="warning",
+        )
+    )
+    threading.Thread(target=server.run, daemon=True).start()
+    try:
+        _await_card("http://127.0.0.1:9397/.well-known/agent-card.json")
+        statuses: list[str] = []
+        result = asyncio.run(
+            call_agent("http://127.0.0.1:9397", "trigger error", on_status=statuses.append)
+        )
+        combined = " ".join([*statuses, result])
+        assert "10.0.0.99" not in combined
+        assert "secret internal url" not in combined
+        assert any("execution error; see agent logs for task" in s for s in statuses)
+    finally:
+        server.should_exit = True
+
+
+def test_adk_executor_retries_build_after_invalid_agent_and_fails_on_unreachable_toolset():
+    """_ensure does not wedge on invalid build return, and unreachable toolsets fail closed."""
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.tools.base_toolset import BaseToolset
+
+    from agents.a2a_app import ADKExecutor
+
+    class IdleLlm(BaseLlm):
+        model: str = "idle"
+
+        async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False):
+            return
+            yield
+
+    class BrokenToolset(BaseToolset):
+        async def get_tools(self, readonly_context=None):
+            raise ConnectionError("mcp server unreachable")
+
+    attempts = 0
+
+    def flaky_build():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return object()  # invalid type on first call
+        return LlmAgent(
+            name="test_agent",
+            model=IdleLlm(),
+            instruction="noop",
+            tools=[BrokenToolset()],
+        )
+
+    executor = ADKExecutor(flaky_build)
+    with pytest.raises(TypeError, match="Expected BaseAgent or Runner"):
+        asyncio.run(executor._ensure())
+
+    # Second attempt succeeds because _ensure did not cache the invalid object.
+    agent = asyncio.run(executor._ensure())
+    assert agent.name == "test_agent"
+
+    # Unreachable toolset raises in _verify_toolsets instead of silently returning [].
+    with pytest.raises(ConnectionError, match="mcp server unreachable"):
+        asyncio.run(executor._verify_toolsets())
 
 
 def test_demo_state_creates_lock_and_cleans_up_temp_file_on_error(tmp_path, monkeypatch):
@@ -199,55 +312,80 @@ def test_demo_state_creates_lock_and_cleans_up_temp_file_on_error(tmp_path, monk
 
 
 def test_build_react_agent_executes_tool_loop():
-    """build_react_agent runs model -> ToolNode -> model, prepends SystemMessage,
-    and supports interrupt_before."""
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-    from langchain_core.tools import tool
-    from langgraph.checkpoint.memory import InMemorySaver
+    """build_react_agent runs model -> FunctionTool -> model, passes instruction,
+    and supports require_confirmation."""
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.runners import InMemoryRunner
+    from google.genai import types
 
     from common.llm import build_react_agent
 
-    @tool
     def ping(host: str) -> str:
         """Return pong for host."""
         return f"pong:{host}"
 
-    class StubModel:
-        def __init__(self):
-            self.turns = 0
-            self.seen_system: list[str] = []
+    class StubModel(BaseLlm):
+        model: str = "stub"
+        turns: int = 0
+        seen_system: list[str] = []
 
-        def bind_tools(self, tools):
-            return self
-
-        async def ainvoke(self, messages):
-            assert isinstance(messages[0], SystemMessage)
-            self.seen_system.append(messages[0].content)
+        async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False):
+            assert llm_request.config and llm_request.config.system_instruction
+            self.seen_system.append(str(llm_request.config.system_instruction))
             self.turns += 1
             if self.turns == 1:
-                return AIMessage(
-                    content="",
-                    tool_calls=[{"id": "call_1", "name": "ping", "args": {"host": "db"}}],
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_function_call(name="ping", args={"host": "db"})],
+                    )
                 )
-            return AIMessage(content=f"done after {messages[-1].content}")
+                return
+            last_fr = llm_request.contents[-1].parts[0].function_response.response
+            yield LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=f"done after {last_fr['result']}")],
+                )
+            )
+
+    async def _run(agent, text: str):
+        runner = InMemoryRunner(agent=agent, app_name="test_app")
+        session = await runner.session_service.create_session(app_name="test_app", user_id="u1")
+        events = []
+        async for ev in runner.run_async(
+            user_id="u1",
+            session_id=session.id,
+            new_message=types.Content(role="user", parts=[types.Part.from_text(text=text)]),
+        ):
+            events.append(ev)
+        return events
 
     model = StubModel()
-    graph = build_react_agent(model, [ping], prompt="system rules")
-    out = asyncio.run(graph.ainvoke({"messages": [HumanMessage(content="check db")]}))
-    assert out["messages"][-1].content == "done after pong:db"
-    assert model.seen_system == ["system rules", "system rules"]
+    agent = build_react_agent(model, [ping], prompt="system rules")
+    events = asyncio.run(_run(agent, "check db"))
+    assert events[-1].content.parts[0].text == "done after pong:db"
+    assert len(model.seen_system) == 2
+    assert all("system rules" in s for s in model.seen_system)
 
     gated = build_react_agent(
         StubModel(),
         [ping],
         prompt="system rules",
-        checkpointer=InMemorySaver(),
-        interrupt_before=["tools"],
+        require_confirmation=True,
     )
-    cfg = {"configurable": {"thread_id": "t1"}}
-    paused = asyncio.run(gated.ainvoke({"messages": [HumanMessage(content="check db")]}, cfg))
-    assert len(paused["messages"]) == 2
-    assert gated.get_state(cfg).next == ("tools",)
+    paused_events = asyncio.run(_run(gated, "check db"))
+    confirm_calls = [
+        part.function_call.name
+        for ev in paused_events
+        if ev.content and ev.content.parts
+        for part in ev.content.parts
+        if part.function_call
+    ]
+    assert "adk_request_confirmation" in confirm_calls
+    assert any(ev.long_running_tool_ids for ev in paused_events)
 
 
 def _await_card(url: str, attempts: int = 50) -> None:

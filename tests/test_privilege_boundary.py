@@ -17,19 +17,19 @@ from agents.operator import operator_agent
 WRITE_TOOL_NAMES = {"restart_deployment", "scale_deployment", "run_command"}
 
 
-def _connection_urls(client) -> str:
-    return " ".join(str(conn) for conn in client.connections.values())
+def _toolset_urls(toolsets: dict) -> str:
+    return " ".join(str(ts.connection_params) for ts in toolsets.values())
 
 
 def test_observer_is_not_wired_to_any_write_server():
-    client = observer_agent._mcp_client()
-    urls = _connection_urls(client)
+    toolsets = observer_agent._mcp_toolsets()
+    urls = _toolset_urls(toolsets)
     assert "8201" not in urls and "8202" not in urls, urls
-    assert "k8s_write" not in urls and "shell" not in client.connections
+    assert "k8s_write" not in urls and "shell" not in toolsets
 
 
 def test_observer_reaches_all_three_read_servers():
-    assert set(observer_agent._mcp_client().connections) == {
+    assert set(observer_agent._mcp_toolsets()) == {
         "k8s_ro",
         "prometheus_alerts",
         "es_logs",
@@ -37,7 +37,7 @@ def test_observer_reaches_all_three_read_servers():
 
 
 def test_operator_holds_the_write_servers():
-    assert set(operator_agent._mcp_client().connections) == {"k8s_write", "shell"}
+    assert set(operator_agent._mcp_toolsets()) == {"k8s_write", "shell"}
 
 
 def test_remediation_tool_is_the_observers_only_route_to_change():
@@ -63,6 +63,21 @@ def test_agent_urls_are_resolved_at_call_time(monkeypatch):
     monkeypatch.setenv("K8S_WRITE_URL", "http://custom-k8s-write:8201/mcp")
     monkeypatch.setenv("OPERATOR_URL", "http://custom-operator:9301")
 
-    assert "custom-k8s-ro" in _connection_urls(observer_agent._mcp_client())
-    assert "custom-k8s-write" in _connection_urls(operator_agent._mcp_client())
+    assert "custom-k8s-ro" in _toolset_urls(observer_agent._mcp_toolsets())
+    assert "custom-k8s-write" in _toolset_urls(operator_agent._mcp_toolsets())
     assert remediation_tool._operator_url() == "http://custom-operator:9301"
+
+
+def test_operator_require_approval_enables_toolset_confirmation(monkeypatch):
+    """When REQUIRE_APPROVAL=1, build_operator configures require_confirmation on MCP toolsets."""
+    import asyncio
+
+    monkeypatch.setenv("REQUIRE_APPROVAL", "1")
+    op = asyncio.run(operator_agent.build_operator())
+    assert op.tools and all(getattr(t, "require_confirmation", False) is True for t in op.tools)
+
+    monkeypatch.setenv("REQUIRE_APPROVAL", "0")
+    op_default = asyncio.run(operator_agent.build_operator())
+    assert op_default.tools and all(
+        getattr(t, "require_confirmation", False) is False for t in op_default.tools
+    )

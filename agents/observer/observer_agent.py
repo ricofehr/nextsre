@@ -1,5 +1,5 @@
-"""Observer agent: a LangGraph ReAct agent over the READ MCP tools, plus the
-single `request_remediation` tool that delegates change to the Operator over
+"""Observer agent: a Google ADK LlmAgent over the READ MCP toolsets, plus the
+single ``request_remediation`` tool that delegates change to the Operator over
 A2A. It has no write tools of its own.
 """
 
@@ -7,34 +7,35 @@ from __future__ import annotations
 
 import os
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
 
 from agents.observer.remediation_tool import request_remediation
-from common.llm import build_react_agent, local_llm
+from common.llm import build_adk_agent, local_llm
 
 DEFAULT_K8S_RO_URL = "http://localhost:8101/mcp"
 DEFAULT_PROMETHEUS_ALERTS_URL = "http://localhost:8102/mcp"
 DEFAULT_ES_LOGS_URL = "http://localhost:8103/mcp"
 
 
-def _mcp_client() -> MultiServerMCPClient:
-    """Build the MCP client from current environment variables (not frozen at import)."""
-    return MultiServerMCPClient(
-        {
-            "k8s_ro": {
-                "transport": "streamable_http",
-                "url": os.environ.get("K8S_RO_URL", DEFAULT_K8S_RO_URL),
-            },
-            "prometheus_alerts": {
-                "transport": "streamable_http",
-                "url": os.environ.get("PROMETHEUS_ALERTS_URL", DEFAULT_PROMETHEUS_ALERTS_URL),
-            },
-            "es_logs": {
-                "transport": "streamable_http",
-                "url": os.environ.get("ES_LOGS_URL", DEFAULT_ES_LOGS_URL),
-            },
-        }
-    )
+def _mcp_toolsets() -> dict[str, McpToolset]:
+    """Build the MCP toolsets from current environment variables (not frozen at import)."""
+    return {
+        "k8s_ro": McpToolset(
+            connection_params=StreamableHTTPConnectionParams(
+                url=os.environ.get("K8S_RO_URL", DEFAULT_K8S_RO_URL),
+            )
+        ),
+        "prometheus_alerts": McpToolset(
+            connection_params=StreamableHTTPConnectionParams(
+                url=os.environ.get("PROMETHEUS_ALERTS_URL", DEFAULT_PROMETHEUS_ALERTS_URL),
+            )
+        ),
+        "es_logs": McpToolset(
+            connection_params=StreamableHTTPConnectionParams(
+                url=os.environ.get("ES_LOGS_URL", DEFAULT_ES_LOGS_URL),
+            )
+        ),
+    }
 
 
 SYSTEM = """You are an SRE observability agent. You can ONLY read - cluster
@@ -60,5 +61,10 @@ End with a short incident report: symptom, root cause, action taken, outcome."""
 
 
 async def build_observer():
-    read_tools = await _mcp_client().get_tools()
-    return build_react_agent(local_llm(), [*read_tools, request_remediation], prompt=SYSTEM)
+    read_toolsets = list(_mcp_toolsets().values())
+    return build_adk_agent(
+        local_llm(),
+        [*read_toolsets, request_remediation],
+        prompt=SYSTEM,
+        name="observer",
+    )

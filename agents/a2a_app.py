@@ -1,19 +1,20 @@
-"""Shared A2A plumbing for both agents (a2a-sdk 1.x, proto types).
+"""Shared A2A plumbing for both agents (a2a-sdk 1.x, proto types, Google ADK).
 
 Contains:
 * ``build_app``        - assemble a Starlette ASGI app from a card + executor
-* ``LangGraphExecutor`` - bridge a LangGraph agent to A2A, streaming each graph
-                          step as a Task status update and the final answer as
-                          an artifact
+* ``ADKExecutor``      - bridge an ADK agent builder to A2A via ADK's
+                         ``A2aAgentExecutor`` and ``InMemoryRunner``, with
+                         single-flight lazy initialization and sanitized errors
 * ``call_agent``       - act as an A2A client: resolve a remote card, send a
-                          message, and collect the streamed result
+                         message, and collect the streamed result
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -25,8 +26,11 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes.agent_card_routes import create_agent_card_routes
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
-from a2a.types import AgentCard, Part, TaskState
+from a2a.types import AgentCard, Part, TaskState, TaskStatusUpdateEvent
 from a2a.utils import DEFAULT_RPC_URL
+from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
+from google.adk.agents.base_agent import BaseAgent
+from google.adk.runners import InMemoryRunner, Runner
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -66,117 +70,112 @@ def build_app(
 
 
 # --------------------------------------------------------------------------- #
-#  Server: LangGraph -> A2A executor with streaming Task lifecycle
+#  Server: ADK -> A2A executor with single-flight lazy init & sanitized errors
 # --------------------------------------------------------------------------- #
-def _summarize_step(payload: dict) -> str | None:
-    """Map one LangGraph 'updates' chunk to a short human-readable note."""
-    msgs = payload.get("messages") if isinstance(payload, dict) else None
-    if not msgs:
-        return None
-    last = msgs[-1]
-    tool_calls = getattr(last, "tool_calls", None)
-    if tool_calls:
-        names = ", ".join(tc["name"] for tc in tool_calls)
-        return f"calling tools: {names}"
-    if last.__class__.__name__ == "ToolMessage":
-        name = getattr(last, "name", "tool")
-        return f"tool '{name}' returned"
-    return None
+def _has_adk_error(event: TaskStatusUpdateEvent) -> bool:
+    for meta in (
+        event.metadata,
+        event.status.message.metadata if event.status.message else None,
+    ):
+        if meta and any("error_code" in k for k in meta):
+            return True
+    return False
 
 
-def _is_interrupted(agent, config: dict) -> bool:
-    """True when the graph stopped at an interrupt instead of finishing.
+class _SanitizingEventQueue(EventQueue):
+    """Wrap an EventQueue to sanitize raw exception messages on error events."""
 
-    Only graphs built with a checkpointer (REQUIRE_APPROVAL=1) can interrupt, so
-    that is the condition tested. Deliberately no ``except`` around
-    ``get_state``: swallowing an error here would report "task complete" for a
-    remediation that was interrupted and never ran, which is the exact failure
-    this check exists to prevent. Let it raise and fail the Task instead.
-    """
-    if getattr(agent, "checkpointer", None) is None:
-        return False
-    return bool(agent.get_state(config).next)
+    def __init__(self, inner: EventQueue, task_id: str | None) -> None:
+        self._inner = inner
+        self._task_id = task_id
+
+    async def enqueue_event(self, event: Any) -> None:
+        if isinstance(event, TaskStatusUpdateEvent) and (
+            event.status.state == TaskState.TASK_STATE_FAILED or _has_adk_error(event)
+        ):
+            if event.status.message and event.status.message.parts:
+                tid = event.task_id or self._task_id or "unknown"
+                del event.status.message.parts[:]
+                event.status.message.parts.append(
+                    Part(text=f"execution error; see agent logs for task {tid}")
+                )
+        await self._inner.enqueue_event(event)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
-class LangGraphExecutor(AgentExecutor):
-    """Wrap an async LangGraph builder as a streaming A2A AgentExecutor."""
+class ADKExecutor(AgentExecutor):
+    """Wrap an async/sync ADK agent builder in ADK's ``A2aAgentExecutor``."""
 
-    def __init__(self, build_agent: Callable[[], Awaitable]):
+    def __init__(self, build_agent: Callable[[], Awaitable[Any] | Any]):
         self._build = build_agent
-        self._agent = None
+        self._agent: Any = None
+        self._runner: Runner | None = None
         self._lock = asyncio.Lock()
+        self._delegate = A2aAgentExecutor(runner=self._ensure_runner)
 
-    async def _ensure(self):
-        if self._agent is None:
+    async def _ensure(self) -> Any:
+        if self._runner is None:
             async with self._lock:
-                if self._agent is None:
-                    self._agent = await self._build()
+                if self._runner is None:
+                    built = self._build()
+                    agent = await built if inspect.isawaitable(built) else built
+                    if isinstance(agent, Runner):
+                        runner = agent
+                    elif isinstance(agent, BaseAgent):
+                        runner = InMemoryRunner(
+                            agent=agent,
+                            app_name=agent.name or "sre_agent",
+                        )
+                    else:
+                        raise TypeError(f"Expected BaseAgent or Runner, got {type(agent)}")
+                    self._agent = agent
+                    self._runner = runner
         return self._agent
 
+    async def _ensure_runner(self) -> Runner:
+        await self._ensure()
+        assert self._runner is not None
+        return self._runner
+
+    async def _verify_toolsets(self) -> None:
+        from google.adk.tools.base_toolset import BaseToolset
+
+        tools = getattr(self._agent, "tools", None) or []
+        for tool in tools:
+            if isinstance(tool, BaseToolset):
+                await tool.get_tools()
+
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        # The protocol requires the Task to be enqueued before any status event.
-        task = context.current_task
-        if task is None:
-            task = new_task_from_user_message(context.message)
-            await event_queue.enqueue_event(task)
-        updater = TaskUpdater(event_queue, task.id, task.context_id)
-
-        # Everything below runs inside the try: building the agent connects to the
-        # MCP servers and the LLM, and an exception escaping execute() is
-        # serialized into the JSON-RPC error verbatim for the remote caller.
         try:
-            agent = await self._ensure()
-            await updater.start_work(
-                updater.new_agent_message([Part(text="received request; investigating")])
-            )
-
-            config = {"configurable": {"thread_id": context.context_id}}
-            final_text = ""
-            async for chunk in agent.astream(
-                {"messages": [{"role": "user", "content": context.get_user_input()}]},
-                config=config,
-                stream_mode="updates",
-            ):
-                for payload in chunk.values():
-                    note = _summarize_step(payload)
-                    if note:
-                        await updater.update_status(
-                            TaskState.TASK_STATE_WORKING,
-                            updater.new_agent_message([Part(text=note)]),
-                        )
-                    msgs = payload.get("messages") if isinstance(payload, dict) else None
-                    if msgs and getattr(msgs[-1], "content", None):
-                        final_text = msgs[-1].content
-
-            if _is_interrupted(agent, config):
-                # REQUIRE_APPROVAL=1 stops the graph before the tools node. Saying
-                # "complete" here would report a remediation that never ran.
-                await updater.requires_input(
-                    updater.new_agent_message(
-                        [Part(text="paused for human approval before running any tool")]
-                    )
-                )
-                return
-
-            await updater.add_artifact([Part(text=final_text)], name="report")
-            await updater.complete(updater.new_agent_message([Part(text="task complete")]))
-        except Exception:  # surface failures as a failed Task
-            # The detail stays in this process' logs: the caller is a remote agent,
-            # and raw exception text leaks internal URLs, paths and tool arguments.
-            log.exception("agent execution failed for task %s", task.id)
+            await self._ensure_runner()
+            await self._verify_toolsets()
+            safe_queue = _SanitizingEventQueue(event_queue, context.task_id)
+            await self._delegate.execute(context, safe_queue)
+        except Exception:  # surface failures as a failed Task without leaking internals
+            task = context.current_task
+            if task is None and context.message is not None:
+                task = new_task_from_user_message(context.message)
+                await event_queue.enqueue_event(task)
+            task_id = task.id if task is not None else (context.task_id or "unknown")
+            context_id = task.context_id if task is not None else (context.context_id or "unknown")
+            log.exception("agent execution failed for task %s", task_id)
             try:
+                updater = TaskUpdater(event_queue, task_id, context_id)
                 await updater.failed(
                     updater.new_agent_message(
-                        [Part(text=f"execution error; see agent logs for task {task.id}")]
+                        [Part(text=f"execution error; see agent logs for task {task_id}")]
                     )
                 )
             except Exception:
-                # The task already reached a terminal state; nothing left to report.
-                log.exception("could not mark task %s failed", task.id)
+                log.exception("could not mark task %s failed", task_id)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        await updater.cancel()
+        await self._delegate.cancel(context, event_queue)
+
+
+LangGraphExecutor = ADKExecutor
 
 
 # --------------------------------------------------------------------------- #

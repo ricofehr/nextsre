@@ -1,8 +1,8 @@
 """The Observer's single bridge to action.
 
-`request_remediation` is an ordinary LangChain tool from the LLM's point of
-view, but under the hood it is an A2A client call to the Operator agent. It is
-the ONLY tool the Observer has that can change anything - and it crosses a
+``request_remediation`` is an ordinary ADK ``FunctionTool`` from the LLM's point
+of view, but under the hood it is an A2A client call to the Operator agent. It
+is the ONLY tool the Observer has that can change anything - and it crosses a
 process/network boundary into an agent with its own, independent harness.
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-from langchain_core.tools import tool
+from google.adk.tools import FunctionTool
 
 from agents.a2a_app import call_agent
 
@@ -22,8 +22,7 @@ def _operator_url() -> str:
     return os.environ.get("OPERATOR_URL", DEFAULT_OPERATOR_URL)
 
 
-@tool
-async def request_remediation(action: str) -> str:
+async def _request_remediation(action: str) -> str:
     """Delegate an infrastructure CHANGE to the operator agent.
 
     `action` must be ONE precise, self-contained instruction, e.g.
@@ -35,3 +34,7 @@ async def request_remediation(action: str) -> str:
     # Observer's task, and with equal timeouts the outer one always fires first,
     # surfacing a slow-but-successful remediation as a client timeout.
     return await call_agent(_operator_url(), action, timeout=OPERATOR_TIMEOUT_S)
+
+
+_request_remediation.__name__ = "request_remediation"
+request_remediation = FunctionTool(_request_remediation)
