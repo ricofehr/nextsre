@@ -6,7 +6,7 @@
 
 NextSRE is a multi-agent incident-response system built on a deliberate privilege split. A **read-only Observer** investigates a reported incident by gathering evidence from Kubernetes, Prometheus alerts, and Elasticsearch, then decides whether a remediation is warranted. If it is, the Observer hands a single, precise instruction to a **write-capable Operator** over the **A2A (Agent-to-Agent) protocol**. The Operator re-evaluates that instruction against its own policy harness and executes it if safe.
 
-The privilege boundary is physical, not just conventional. The Observer process has zero write tools — it cannot mutate infrastructure even if the LLM is manipulated. The Operator has write tools but its MCP servers enforce hard policy (namespace allowlists, replica caps, binary allowlists) that rejects violations before any mutation reaches the cluster, independent of the LLM's judgment. A third optional layer — a LangGraph human-approval checkpointer — can pause execution before writes if `REQUIRE_APPROVAL=1`.
+The privilege boundary is physical, not just conventional. The Observer process has zero write tools — it cannot mutate infrastructure even if the LLM is manipulated. The Operator has write tools but its MCP servers enforce hard policy (namespace allowlists, replica caps, binary allowlists) that rejects violations before any mutation reaches the cluster, independent of the LLM's judgment. A third optional layer — an ADK human-approval confirmation gate (`require_confirmation=True`) — can pause execution before writes if `REQUIRE_APPROVAL=1`.
 
 Both agents are stateless HTTP services. All tools come from external MCP servers they connect to at startup, so the tool surface can be audited, versioned, and swapped without touching agent code. A synthetic demo mode (`DEMO_MODE=1`, the default) provides a shared JSON cluster state across all five MCP servers, enabling full end-to-end runs without real infrastructure or a cloud LLM.
 
@@ -15,14 +15,14 @@ fire_incident.py
       │  A2A JSON-RPC (port 9300)
       ▼
 ┌─────────────────────────────────────┐
-│  Observer (LangGraph ReAct)         │  read MCP tools only
+│  Observer (Google ADK LlmAgent)     │  read MCP tools only
 │   k8s-ro · prom-alerts · es-logs    │
 └──────────┬──────────────────────────┘
            │  request_remediation()
            │  A2A JSON-RPC (port 9301)
            ▼
 ┌─────────────────────────────────────┐
-│  Operator (LangGraph ReAct)         │  write MCP tools + harness
+│  Operator (Google ADK LlmAgent)     │  write MCP tools + harness
 │   k8s-write · shell-exec            │
 └─────────────────────────────────────┘
 ```
@@ -33,11 +33,11 @@ fire_incident.py
 
 **Entry point:** `agents/observer/server.py` → `agents/observer/observer_agent.py`
 
-The Observer is a LangGraph ReAct agent that loads three read-only MCP servers as its tool surface and one synthetic write tool (`request_remediation`) that actually crosses the network to the Operator.
+The Observer is an ADK `LlmAgent` that loads three read-only MCP servers as its tool surface (`McpToolset`) and one synthetic write tool (`request_remediation`) that actually crosses the network to the Operator.
 
 ### Tool surface
 
-At startup `build_observer()` creates a `MultiServerMCPClient` connecting to:
+At startup `build_observer()` creates three `McpToolset` instances connecting to:
 
 | Logical name | Default URL | Provides |
 |---|---|---|
@@ -62,16 +62,17 @@ The phrase _"If (and only if)"_ in the prompt is load-bearing: it tells the LLM 
 
 ### The remediation bridge (`agents/observer/remediation_tool.py`)
 
-`request_remediation` is a LangChain `@tool` that wraps `call_agent` from `agents/a2a_app.py`. It sends the Observer's `action` string as plain text to the Operator's A2A endpoint and returns the Operator's textual report. From the LLM's perspective it looks like any other tool call; underneath it is a full JSON-RPC round-trip to a separate process.
+`request_remediation` is an ADK `FunctionTool` that wraps `call_agent` from `agents/a2a_app.py`. It sends the Observer's `action` string as plain text to the Operator's A2A endpoint and returns the Operator's textual report. From the LLM's perspective it looks like any other tool call; underneath it is a full JSON-RPC round-trip to a separate process.
 
 ```python
-@tool
-async def request_remediation(action: str) -> str:
+async def _request_remediation(action: str) -> str:
     """Delegate ONE precise infrastructure change to the write agent."""
-    return await call_agent(OPERATOR_URL, action)
+    return await call_agent(_operator_url(), action, timeout=OPERATOR_TIMEOUT_S)
+
+request_remediation = FunctionTool(_request_remediation)
 ```
 
-The Observer never sees write MCP tools. Its tool list at runtime is exactly the three MCP servers plus this one bridge.
+The Observer never sees write MCP tools. Its tool list at runtime is exactly the three MCP toolsets plus this one bridge.
 
 ### Agent card (`agents/observer/card.py`)
 
@@ -83,7 +84,7 @@ Advertises the `investigate` skill with tags `["sre", "read-only", "diagnosis"]`
 
 **Entry point:** `agents/operator/server.py` → `agents/operator/operator_agent.py`
 
-The Operator is a LangGraph ReAct agent with two write MCP servers and a three-layer policy harness. It receives a remediation proposal from the Observer but treats it as something to verify, not blindly execute.
+The Operator is an ADK `LlmAgent` with two write MCP toolsets and a three-layer policy harness. It receives a remediation proposal from the Observer but treats it as something to verify, not blindly execute.
 
 ### Tool surface
 
@@ -108,23 +109,23 @@ The prompt sets three behavioural rules on top of the tool-level harness:
 
 **Layer 2 — Behavioural policy** (system prompt): the rules above guide the LLM toward safe choices before it ever calls a tool.
 
-**Layer 3 — Human approval gate** (optional LangGraph checkpointer):
+**Layer 3 — Human approval gate** (optional ADK tool confirmation):
 
 ```python
-if env_flag("REQUIRE_APPROVAL", default=False):
-    graph = build_react_agent(
-        llm, tools,
-        prompt=SYSTEM,
-        checkpointer=InMemorySaver(),
-        interrupt_before=["tools"],
-    )
+require_confirmation = env_flag("REQUIRE_APPROVAL", default=False)
+toolsets = list(_mcp_toolsets(require_confirmation=require_confirmation).values())
+return build_adk_agent(
+    local_llm(),
+    toolsets,
+    prompt=SYSTEM,
+    name="operator",
+    require_confirmation=require_confirmation,
+)
 ```
 
-When enabled, the graph pauses before every tool node. This is the only layer that stops execution _before_ a tool call; layers 1 and 2 operate during or after the LLM's decision.
+When enabled, ADK's confirmation gate pauses before any write tool runs and emits an `adk_request_confirmation` long-running tool call. `A2aAgentExecutor` converts this into `TASK_STATE_INPUT_REQUIRED` rather than reporting completion — otherwise the caller would receive a plausible-looking report for a remediation that never ran.
 
-`LangGraphExecutor` detects the interrupt (`agent.get_state(config).next` is non-empty) and puts the A2A Task into `TASK_STATE_INPUT_REQUIRED` rather than reporting completion — otherwise the caller would receive a plausible-looking report for a remediation that never ran.
-
-**Known limitation:** resuming an approved task is not implemented. `call_agent` opens a fresh context per call, so there is no channel to continue the checkpointed thread. `REQUIRE_APPROVAL=1` therefore halts remediation rather than gating it.
+**Known limitation:** resuming an approved task is not implemented. `call_agent` opens a fresh context per call, so there is no channel to continue the paused session. `REQUIRE_APPROVAL=1` therefore halts remediation rather than gating it.
 
 ### Agent card (`agents/operator/card.py`)
 
@@ -146,35 +147,21 @@ A2A (Agent-to-Agent, `a2a-sdk==1.3.0`) is a JSON-RPC-over-HTTP protocol for agen
 
 Creates the ASGI application used by both agents. Mounts the A2A JSON-RPC handler at `POST /`, serves the agent card on `GET /.well-known/agent-card.json`, and wraps the app in `TrustedHostMiddleware` (DNS-rebinding protection). Both `observer/server.py` and `operator/server.py` call this with their own card and executor and pass the result to `uvicorn.run`.
 
-#### `LangGraphExecutor`
+#### `ADKExecutor`
 
-Bridges a LangGraph `CompiledStateGraph` to the `AgentExecutor` interface expected by the A2A SDK.
+Bridges an ADK `LlmAgent` builder to the `AgentExecutor` interface expected by the A2A SDK, delegating execution to ADK's built-in `A2aAgentExecutor` and `InMemoryRunner`.
 
 ```python
-class LangGraphExecutor(AgentExecutor):
-    def __init__(self, build_agent: Callable[[], Awaitable]):
+class ADKExecutor(AgentExecutor):
+    def __init__(self, build_agent: Callable[[], Awaitable[Any] | Any]):
         self._build = build_agent
         self._agent = None
+        self._runner = None
         self._lock = asyncio.Lock()
-
-    async def _ensure(self):
-        if self._agent is None:
-            async with self._lock:
-                if self._agent is None:
-                    self._agent = await self._build()
-        return self._agent
-
-    async def execute(self, context: RequestContext, event_queue: EventQueue):
-        agent = await self._ensure()
-        # streams LangGraph node updates as TaskStatusUpdate events
-        # final response becomes a TaskArtifact
+        self._delegate = A2aAgentExecutor(runner=self._ensure_runner)
 ```
 
-The executor lazily builds the agent on first call under an `asyncio.Lock` (so MCP server connections are established once after the HTTP server is already listening). It iterates `agent.astream(..., stream_mode="updates")`, translates each LangGraph node update to a human-readable status string via `_summarize_step`, enqueues those as `TaskStatusUpdate`, and enqueues the last message content as a `TaskArtifact` when the graph terminates.
-
-`_summarize_step` maps LangGraph node updates to status strings:
-- tool calls emitted → `"calling tools: <names>"`
-- `ToolMessage` returned → `"tool '<name>' returned"`
+The executor lazily builds the agent and `InMemoryRunner` on first call under an `asyncio.Lock` (so concurrent cold-start requests build the agent at most once), delegates event conversion and task lifecycle management to `A2aAgentExecutor`, and sanitizes unexpected failure messages so internal URLs or stack traces are not leaked to remote callers.
 
 #### `call_agent(base_url, text, *, on_status, timeout) -> str`
 
@@ -198,54 +185,51 @@ async def call_agent(base_url, text, *, on_status=None, timeout=180) -> str:
 
 ---
 
-## LangChain / LangGraph
+## Google ADK Runtime
 
 ### LLM factory (`common/llm.py`)
 
 ```python
-def local_llm(model: str | None = None) -> ChatOpenAI:
-    return ChatOpenAI(
-        base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
-        model=os.getenv("LLM_MODEL", "gemma3:27b"),
-        api_key=os.getenv("LLM_API_KEY", "local"),
-        temperature=0,
-        timeout=120,
+def local_llm(model: str | None = None) -> OpenAILlm:
+    return OpenAILlm(
+        model=model or os.environ.get("LLM_MODEL", "gemma3:27b"),
+        base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
+        api_key=os.environ.get("LLM_API_KEY", "local"),
     )
 ```
 
-`temperature=0` is intentional: SRE decisions should be deterministic given the same evidence. The `ChatOpenAI` class is used as an OpenAI-compatible client — any server that speaks the `/v1/chat/completions` API works (Ollama, llama.cpp, vLLM, LM Studio, and OpenAI itself).
+`temperature=0` is configured on the `LlmAgent`'s `GenerateContentConfig`: SRE decisions should be deterministic given the same evidence. `OpenAILlm` (`google.adk.integrations.openai`) is used as an OpenAI-compatible client — any server that speaks the `/v1/chat/completions` API works (Ollama, llama.cpp, vLLM, LM Studio, and OpenAI itself).
 
-### ReAct agent construction
+### Agent construction
 
-Both agents are built with `build_react_agent` from `common/llm.py` (which compiles a two-node `StateGraph(MessagesState)` over `ToolNode` and `tools_condition`, avoiding the deprecated `langgraph.prebuilt.create_react_agent`):
+Both agents are built with `build_adk_agent` (aliased as `build_react_agent`) from `common/llm.py`, which constructs an ADK `LlmAgent`:
 
 ```python
-tools = await _mcp_client().get_tools()
-agent = build_react_agent(local_llm(), tools, prompt=SYSTEM)
+read_toolsets = list(_mcp_toolsets().values())
+agent = build_adk_agent(local_llm(), [*read_toolsets, request_remediation], prompt=SYSTEM, name="observer")
 ```
 
-`build_react_agent` compiles a LangGraph `StateGraph` with two nodes: `"agent"` (calls the LLM with the system prompt + current message list) and `"tools"` (executes the tool calls the LLM returned). The graph loops until the LLM emits a message with no tool calls.
+### Tool loading via `McpToolset`
 
-### Tool loading via `MultiServerMCPClient`
+`google.adk.tools.mcp_tool.McpToolset` with `StreamableHTTPConnectionParams` connects to each MCP HTTP endpoint (`streamable_http` transport) and exposes all its tools to the ADK `LlmAgent`. Each tool is described by the MCP server's tool schema; the LLM sees the tool name, description, and JSON Schema for its arguments.
 
-`langchain-mcp-adapters==0.3.2` provides `MultiServerMCPClient`, which connects to multiple MCP HTTP endpoints (`streamable_http` transport) and exposes all their tools as LangChain `BaseTool` objects via `await client.get_tools()`. Each tool is described by the MCP server's tool schema; the LLM sees the tool name, description, and JSON Schema for its arguments.
-
-### The checkpointer and interrupt pattern (Operator only)
+### Tool confirmation gate (Operator only)
 
 When `REQUIRE_APPROVAL=1`:
 
 ```python
-graph = build_react_agent(
-    llm, tools,
+require_confirmation = env_flag("REQUIRE_APPROVAL", default=False)
+toolsets = list(_mcp_toolsets(require_confirmation=require_confirmation).values())
+agent = build_adk_agent(
+    local_llm(),
+    toolsets,
     prompt=SYSTEM,
-    checkpointer=InMemorySaver(),
-    interrupt_before=["tools"],
+    name="operator",
+    require_confirmation=require_confirmation,
 )
 ```
 
-`interrupt_before=["tools"]` tells LangGraph to pause the graph just before executing tool calls and persist state in the `InMemorySaver`. This is the only mechanism in the system that could give a human veto power over a specific action _after_ the LLM has decided to take it but _before_ it reaches the cluster.
-
-In principle a human inspects the pending tool call and calls `graph.invoke(None, config)` to resume. **That resume path is not wired up here** — see the Known limitation above: `call_agent` opens a fresh context per call, so nothing can continue the checkpointed thread. `REQUIRE_APPROVAL=1` currently halts remediation and reports `TASK_STATE_INPUT_REQUIRED`; it does not gate it.
+`require_confirmation=True` tells ADK's tool execution pipeline (`apply_confirmation_gate`) to hold back unconfirmed tool calls and emit an `adk_request_confirmation` function call instead of executing the tool. `A2aAgentExecutor` surfaces this as `TASK_STATE_INPUT_REQUIRED`.
 
 ---
 
@@ -370,85 +354,11 @@ In demo mode the tool returns canned output without executing anything.
 
 ---
 
-## How to Integrate ADK (Google Agent Development Kit)
+## Google ADK Integration Summary
 
-The architecture is intentionally modular: agents are just HTTP services behind an A2A card, tools are MCP servers. ADK can slot in at multiple levels without disrupting the rest.
+NextSRE uses `google-adk[a2a,mcp,openai]` across all three agent layers:
 
-### Option 1 — Replace LangGraph with ADK agents
-
-ADK's `LlmAgent` is equivalent to LangGraph's `create_react_agent`. It runs a ReAct loop, supports tool calling, and can be wrapped in a streaming HTTP server. The migration path for one agent:
-
-```python
-# current (LangGraph)
-agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
-
-# with ADK
-from google.adk.agents import LlmAgent
-from google.adk.models.lite_llm import LiteLlm
-
-agent = LlmAgent(
-    name="observer",
-    model=LiteLlm(model="ollama/gemma3:27b"),
-    tools=tools,           # same LangChain tools or rewrite as ADK FunctionTool
-    instruction=SYSTEM_PROMPT,
-)
-```
-
-The `LangGraphExecutor` in `a2a_app.py` would be replaced by ADK's own A2A runner (ADK has native A2A support via `google.adk.runners`), removing the custom streaming bridge.
-
-### Option 2 — Use ADK's built-in A2A client/server
-
-ADK provides `A2AServer` and `A2AClient` that handle the agent card, SSE streaming, and task lifecycle automatically. The current `build_app`, `LangGraphExecutor`, and `call_agent` in `a2a_app.py` could be replaced:
-
-```python
-# server side (replaces build_app + LangGraphExecutor)
-from google.adk.runners import A2AServer
-server = A2AServer(agent=adk_agent, host="0.0.0.0", port=9300)
-
-# client side (replaces call_agent)
-from google.adk.a2a import A2AClient
-client = A2AClient(base_url=OPERATOR_URL)
-result = await client.send_message(action)
-```
-
-`request_remediation` in `observer/remediation_tool.py` becomes a thin wrapper around `A2AClient.send_message` — the same one-line change as today but using ADK's client.
-
-### Option 3 — Wrap MCP servers as ADK tools
-
-ADK can load MCP servers directly via `MCPToolset`:
-
-```python
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, SseServerParams
-
-toolset = MCPToolset(
-    connection_params=SseServerParams(url="http://localhost:8101/mcp")
-)
-```
-
-This is the same role that `MultiServerMCPClient` plays today. `MCPToolset` is passed to `LlmAgent` instead of `MultiServerMCPClient.get_tools()`. The five MCP servers (`k8s_readonly`, `prometheus_alerts`, `es_logs`, `k8s_write`, `shell_exec`) require zero changes — they are plain MCP HTTP servers and ADK speaks the same protocol.
-
-### Option 4 — ADK multi-agent orchestration
-
-ADK has a native `SequentialAgent` / `ParallelAgent` / `LoopAgent` hierarchy and a `BaseAgent.create_agent_card()` helper. The Observer→Operator delegation pattern maps directly to ADK's parent-child agent model:
-
-```python
-from google.adk.agents import LlmAgent, SequentialAgent
-
-operator = LlmAgent(name="operator", model=..., tools=write_tools)
-observer = LlmAgent(
-    name="observer",
-    model=...,
-    tools=read_tools,
-    sub_agents=[operator],   # ADK auto-generates the delegation tool
-)
-```
-
-With `sub_agents`, ADK generates the `transfer_to_operator` tool automatically — the equivalent of the hand-written `request_remediation` tool. The privilege boundary is maintained because `operator` only receives the tools passed to its `LlmAgent` constructor.
-
-### What stays the same under any ADK option
-
-- The five MCP servers are unchanged — they are framework-agnostic.
-- The demo state (`demo_state.py`) is unchanged.
-- The `docker-compose.yml` service topology (5 MCP + 2 agents) is unchanged.
-- The environment variable conventions (`ALLOWED_NAMESPACES`, `MAX_REPLICAS`, `REQUIRE_APPROVAL`, etc.) are unchanged.
-- The three-layer harness logic lives in the MCP servers, not the agent framework, so it is preserved regardless of which orchestration layer runs above it.
+1. **Agent orchestration (`common/llm.py`)**: Both Observer and Operator are ADK `LlmAgent` instances backed by `OpenAILlm` (`google.adk.integrations.openai`) pointed at the local OpenAI-compatible inference server (`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`).
+2. **A2A server execution (`agents/a2a_app.py`)**: `ADKExecutor` wraps ADK's `A2aAgentExecutor` and `InMemoryRunner` with single-flight lazy initialization (`asyncio.Lock`) and sanitized error reporting, served behind Starlette's `TrustedHostMiddleware`.
+3. **MCP toolsets & confirmation gate (`agents/observer/`, `agents/operator/`)**: Tools are loaded via `McpToolset(connection_params=StreamableHTTPConnectionParams(url=...))`. When `REQUIRE_APPROVAL=1`, the Operator passes `require_confirmation=True` to its MCP toolsets so ADK pauses before executing any write tool.
+4. **Framework-independent MCP servers (`mcp_servers/`)**: The five MCP servers, demo state (`demo_state.py`), `docker-compose.yml` topology, and three-layer harness remain completely decoupled from the agent framework.

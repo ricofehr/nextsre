@@ -48,10 +48,10 @@ length 100.
 ### Agent Split
 - **Observer** (`agents/observer/`) — read-only tools only; cannot mutate infrastructure directly. When remediation is required it calls `request_remediation` which sends an A2A task to the Operator.
 - **Operator** (`agents/operator/`) — write tools with a three-layer policy harness. It re-evaluates the Observer's proposal against its own harness rather than blindly executing it.
-- **`agents/a2a_app.py`** — shared infrastructure: Starlette app builder, `LangGraphExecutor` (bridges LangGraph state updates to A2A Task status events), and `A2AClientWrapper`.
+- **`agents/a2a_app.py`** — shared infrastructure: Starlette app builder, `ADKExecutor` (bridges ADK's `A2aAgentExecutor` and `InMemoryRunner` with single-flight lazy initialization and sanitized failure messages), and `call_agent` A2A client helper.
 
 ### MCP Servers (`mcp_servers/`)
-Five independent HTTP MCP servers provide all tools. Agents load tools dynamically at startup via `MultiServerMCPClient`.
+Five independent HTTP MCP servers provide all tools. Agents load tools via ADK `McpToolset` (`StreamableHTTPConnectionParams`).
 
 | Server | Port | Access |
 |---|---|---|
@@ -67,10 +67,10 @@ Five independent HTTP MCP servers provide all tools. Agents load tools dynamical
 Three independent layers prevent unsafe mutations:
 1. **MCP tool hard policy** — `k8s_write.py` enforces `ALLOWED_NAMESPACES` and `MAX_REPLICAS` env vars; `shell_exec.py` checks binary allowlist, substring denylist, and per-binary verb whitelist. Both raise before any mutation.
 2. **Behavioral policy** — system prompt on the Operator.
-3. **Human approval gate** — LangGraph checkpointer, activated only when `REQUIRE_APPROVAL=1`.
+3. **Human approval gate** — ADK tool confirmation (`require_confirmation=True`), activated only when `REQUIRE_APPROVAL=1`.
 
 ### LLM Integration
-Both agents use LangChain's `ChatOpenAI` configured as an OpenAI-compatible client (`common/llm.py`) pointing to a local Ollama or llama-server instance — not a cloud API. Set `LLM_BASE_URL` and `LLM_MODEL` in `.env`.
+Both agents use Google ADK's `OpenAILlm` (`google.adk.integrations.openai`) configured as an OpenAI-compatible client (`common/llm.py`) pointing to a local Ollama or llama-server instance — not a cloud API. Set `LLM_BASE_URL` and `LLM_MODEL` in `.env`.
 
 ### Demo Mode
 `DEMO_MODE=1` enables a fully synthetic incident: `demo_state.py` maintains fake cluster state in a shared JSON file (path set by `DEMO_STATE_FILE`). All five MCP servers read/write this file so the incident progresses realistically without real infrastructure.

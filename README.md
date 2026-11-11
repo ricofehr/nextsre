@@ -22,9 +22,9 @@ split into a real process/network boundary, not a convention.
  K8s(read) · Prometheus alerts · ES logs   K8s(write) · Shell exec
 ```
 
-Each agent is a **LangGraph** ReAct agent driven by a **local, OpenAI-compatible
-LLM** (Ollama or `llama.cpp`'s `llama-server`). Tools come from **MCP servers**
-loaded via `langchain-mcp-adapters`. Agent-to-agent communication uses the
+Each agent is a **Google ADK** (`LlmAgent`) agent driven by a **local, OpenAI-compatible
+LLM** (Ollama or `llama.cpp`'s `llama-server` via `google-adk[openai]`). Tools come from
+**MCP servers** loaded via ADK's `McpToolset`. Agent-to-agent communication uses the
 **A2A protocol** (`a2a-sdk` 1.x), with the Operator streaming a Task lifecycle
 (status updates + a final report artifact).
 
@@ -42,7 +42,7 @@ loaded via `langchain-mcp-adapters`. Agent-to-agent communication uses the
 | `common/env.py` | fail-closed env parsing — an unrecognised `DEMO_MODE` raises instead of quietly meaning "not demo" |
 | `agents/observer/` | read agent: card, MCP read tools, the A2A `request_remediation` delegate tool |
 | `agents/operator/` | write agent: card, MCP write tools, optional human approval gate |
-| `agents/a2a_app.py` | shared: Starlette app builder, LangGraph→A2A streaming executor, A2A client helper |
+| `agents/a2a_app.py` | shared: Starlette app builder, ADK→A2A streaming executor, A2A client helper |
 | `scripts/fire_incident.py` | reset the seed incident and fire it at the Observer |
 | `tests/` | offline suite (no LLM/cluster): harness regressions, recovery loop, A2A round-trip |
 
@@ -144,9 +144,10 @@ share one cluster.)
    destructive actions and honest reporting. The Observer's prompt marks all tool
    output as untrusted data, since logs and alert annotations are written by the
    workloads under investigation.
-3. **Human approval gate (optional).** `REQUIRE_APPROVAL=1` builds the Operator
-   graph with `interrupt_before=["tools"]` + a checkpointer, pausing before any
-   tool runs so a human can approve/reject.
+3. **Human approval gate (optional).** `REQUIRE_APPROVAL=1` configures the Operator's
+   MCP toolsets with `require_confirmation=True`, pausing before any write tool
+   runs (`adk_request_confirmation` / `TASK_STATE_INPUT_REQUIRED`) so a human can
+   approve/reject.
 
 Layer 1 is only as strong as its weakest tool. `shell_exec` must keep `kubectl`
 read-only: an unrestricted `kubectl` is a way around *everything* in `k8s_write`
@@ -215,8 +216,7 @@ your second line, RBAC is your first.
   `Task` must be enqueued before any status event. All handled in `a2a_app.py`.
 - Runtime versions are pinned exactly in `pyproject.toml` for that reason. The
   optional `real` extra is version-ranged, not pinned.
-- `mcp` stays on 1.x (`1.30.0`): `langchain-mcp-adapters` requires `mcp<2.0.0`,
-  and 2.x renames `FastMCP` to `MCPServer`. The pin clears PYSEC-2026-3483 and
-  CVE-2026-59951 / CVE-2026-116684..116686.
+- `mcp` stays on 1.x (`1.30.0`): 2.x renames `FastMCP` to `MCPServer`. The pin
+  clears PYSEC-2026-3483 and CVE-2026-59951 / CVE-2026-116684..116686.
 - The demo state file is last-write-wins across processes — fine for a demo,
   not a datastore.
