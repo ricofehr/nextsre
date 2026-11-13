@@ -237,7 +237,7 @@ agent = build_adk_agent(
 
 ### Architecture pattern
 
-Each MCP server is a standalone Python module that calls `mcp.server.fastmcp.FastMCP` to register tools and runs a Starlette ASGI app on a dedicated port. All five are built from the same Dockerfile and differ only in their tool definitions and environment configuration.
+Each MCP server is a standalone Python module that calls `mcp.server.mcpserver.MCPServer` to register tools and runs a Starlette ASGI app on a dedicated port. All five are built from the same Dockerfile and differ only in their tool definitions and environment configuration.
 
 ```python
 from common.serving import bind_host, port, transport_security
@@ -245,12 +245,7 @@ from . import backends
 
 # Loopback by default; compose sets MCP_BIND_HOST=0.0.0.0. Never hardcode the
 # bind address - these servers do not authenticate their callers.
-mcp = FastMCP(
-    "server-name",
-    host=bind_host(),
-    port=port(default=PORT),
-    transport_security=transport_security("server-name"),
-)
+mcp = MCPServer("server-name")
 
 @mcp.tool()
 def some_tool(arg: str) -> dict:
@@ -259,7 +254,12 @@ def some_tool(arg: str) -> dict:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=bind_host(),
+        port=port(default=PORT),
+        transport_security=transport_security("server-name"),
+    )
 ```
 
 ### Demo state (`mcp_servers/demo_state.py`)

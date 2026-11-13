@@ -167,7 +167,7 @@ authorization model:
 - MCP servers bind `127.0.0.1` unless `MCP_BIND_HOST` says otherwise; compose
   sets `0.0.0.0` because there the container network is the boundary. Anything
   that can open a socket to `shell-exec:8202` gets command execution.
-- Host/Origin validation is **on**. `FastMCP` treats an unset `transport_security`
+- Host/Origin validation is **on**. `MCPServer` treats an unset `transport_security`
   as "DNS-rebinding protection off" — the inverse of the library's own default —
   so every MCP server passes it explicitly, and `build_app` wraps both A2A agent
   servers in `TrustedHostMiddleware`. Without it, a browser on a machine running
@@ -216,7 +216,7 @@ your second line, RBAC is your first.
   `Task` must be enqueued before any status event. All handled in `a2a_app.py`.
 - Runtime versions are pinned exactly in `pyproject.toml` for that reason. The
   optional `real` extra is version-ranged, not pinned.
-- `mcp` stays on 1.x (`1.30.0`): 2.x renames `FastMCP` to `MCPServer`. The pin
-  clears PYSEC-2026-3483 and CVE-2026-59951 / CVE-2026-116684..116686.
+- `mcp` uses 2.x (`2.3.0`): tools use `MCPServer` (`mcp.server.mcpserver`), with
+  network binding parameters passed on `run()`.
 - The demo state file is last-write-wins across processes — fine for a demo,
   not a datastore.

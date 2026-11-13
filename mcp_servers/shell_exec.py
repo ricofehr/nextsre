@@ -33,17 +33,12 @@ import os
 import shlex
 import subprocess
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from common.env import env_flag
 from common.serving import bind_host, port, transport_security
 
-mcp = FastMCP(
-    "shell-exec",
-    host=bind_host(),
-    port=port(default=8202),
-    transport_security=transport_security("shell-exec"),
-)
+mcp = MCPServer("shell-exec")
 
 ALLOWED_BINARIES = {"kubectl", "systemctl", "journalctl", "df", "free", "ss", "dig", "uptime"}
 
@@ -402,4 +397,9 @@ def run_command(command: str, timeout_s: int = 20) -> dict:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=bind_host(),
+        port=port(default=8202),
+        transport_security=transport_security("shell-exec"),
+    )

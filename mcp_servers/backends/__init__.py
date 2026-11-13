@@ -1,6 +1,6 @@
 """Backend selection: demo substrate or real infrastructure.
 
-Selection happens per call rather than at import. FastMCP registers tools at
+Selection happens per call rather than at import. MCPServer registers tools at
 import time, so reading ``DEMO_MODE`` there would freeze the choice before a test
 (or a container entrypoint) had a chance to set the environment - and would make
 the servers importable only under the right env.
