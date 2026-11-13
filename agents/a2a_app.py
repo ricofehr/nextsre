@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
@@ -65,6 +66,9 @@ class _TelemetryMiddleware:
             "rpc.system": "a2a",
             "http.request.method": str(scope.get("method", "")),
             "url.path": str(scope.get("path", "")),
+            "gen_ai.system": "adk",
+            "gen_ai.agent.name": self._service,
+            "gen_ai.request.model": os.environ.get("LLM_MODEL", "local"),
         }
         with get_tracer(self._service).start_as_current_span(
             "a2a.request",

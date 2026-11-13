@@ -46,7 +46,7 @@ dev = [
 # COPYing the source: an explicit list makes the first pass fail with
 # "package directory 'common' does not exist", while empty discovery is fine.
 [tool.setuptools.packages.find]
-include = ["common*", "mcp_servers*", "agents*"]
+include = ["common*", "mcp_servers*", "agents*", "services*"]
 
 [tool.black]
 line-length = 100

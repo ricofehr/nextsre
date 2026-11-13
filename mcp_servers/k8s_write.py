@@ -22,6 +22,7 @@ import re
 
 from mcp.server.mcpserver import MCPServer
 
+from common.circuit_breaker import circuit_breaker
 from common.env import env_csv, env_flag, env_int
 from common.serving import bind_host, port, transport_security
 from common.telemetry import init_telemetry, traced_tool
@@ -74,6 +75,8 @@ def _guard_ns(namespace: str) -> None:
 def _guard_target(name: str, namespace: str) -> None:
     _guard_ns(namespace)
     _guard_name(name, "deployment")
+    if env_flag("ENABLE_CIRCUIT_BREAKER", default=True):
+        circuit_breaker.check_and_record(namespace, name)
 
 
 @mcp.tool()
@@ -89,7 +92,6 @@ def restart_deployment(name: str, namespace: str) -> dict:
 @traced_tool
 def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
     """Scale a deployment. Hard-capped at MAX_REPLICAS by the harness."""
-    _guard_target(name, namespace)
     ceiling = _max_replicas()
     floor = 0 if env_flag("ALLOW_SCALE_TO_ZERO", default=False) else MIN_REPLICAS
     if not floor <= replicas <= ceiling:
@@ -97,6 +99,7 @@ def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
             f"replicas must be between {floor} and {ceiling}"
             + ("" if floor == 0 else "; set ALLOW_SCALE_TO_ZERO=1 to permit a full stop")
         )
+    _guard_target(name, namespace)
     return backends.k8s_write().scale_deployment(name, namespace, replicas)
 
 
