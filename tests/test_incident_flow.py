@@ -13,7 +13,15 @@ import httpx
 import pytest
 import uvicorn
 
-from mcp_servers import backends, demo_state, es_logs, k8s_readonly, k8s_write, prometheus_alerts
+from mcp_servers import (
+    backends,
+    demo_state,
+    k8s_readonly,
+    k8s_write,
+    loki_logs,
+    prometheus_alerts,
+    tempo_traces,
+)
 
 
 def test_read_tools_report_the_incident():
@@ -24,7 +32,9 @@ def test_read_tools_report_the_incident():
     assert all(p["reason"] == "CrashLoopBackOff" for p in pods)
     assert not any(p["ready"] for p in pods)
 
-    assert "OOMKilled" in k8s_readonly.get_pod_logs("payments-api-00", "payments")
+    pod_logs = k8s_readonly.get_pod_logs("payments-api-00", "payments")
+    assert "OOMKilled" in pod_logs
+    assert "trace_id=" in pod_logs
 
     events = k8s_readonly.recent_warning_events("payments")
     assert any(e["reason"] == "BackOff" for e in events)
@@ -32,8 +42,20 @@ def test_read_tools_report_the_incident():
     alerts = prometheus_alerts.active_alerts("warning")
     assert any(a["severity"] == "critical" for a in alerts)
 
-    docs = es_logs.search_logs("error", service="payments-api")
+    docs = loki_logs.search_logs("error", service="payments-api")
     assert any(d["level"] == "ERROR" for d in docs)
+    trace_ids = {d["trace_id"] for d in docs if d.get("trace_id")}
+    assert trace_ids
+    trace_id = next(iter(trace_ids))
+    assert len(trace_id) == 32
+
+    traces = tempo_traces.search_traces(service="payments-api", status="error")
+    assert any(t["trace_id"] == trace_id and t["status"] == "error" for t in traces)
+
+    detail = tempo_traces.get_trace(trace_id)
+    assert detail["trace_id"] == trace_id
+    assert detail["status"] == "error"
+    assert any(s["status"] == "error" for s in detail["spans"])
 
 
 def test_severity_floor_filters_alerts():
@@ -42,7 +64,7 @@ def test_severity_floor_filters_alerts():
 
 def test_log_search_filters_by_content():
     """regression: a query of "error" used to return every document, healthy ones included."""
-    docs = es_logs.search_logs("OOMKilled", service="payments-api")
+    docs = loki_logs.search_logs("OOMKilled", service="payments-api")
     assert docs and all("oomkilled" in d["message"].lower() for d in docs)
 
 
@@ -59,6 +81,9 @@ def test_restart_resolves_the_incident():
         for a in demo_state.load()["alerts"]
         if a["service"] == "payments-api"
     )
+    assert tempo_traces.search_traces(service="payments-api", status="error") == []
+    ok_traces = tempo_traces.search_traces(service="payments-api", status="ok")
+    assert ok_traces and all(t["status"] == "ok" for t in ok_traces)
 
 
 def test_scale_updates_shared_state():
@@ -92,7 +117,8 @@ def test_pod_logs_respects_tail_lines():
 
 def test_zero_size_returns_nothing():
     """An explicit 0 means "none" - not "one", and not "all"."""
-    assert es_logs.search_logs("error", service="payments-api", size=0) == []
+    assert loki_logs.search_logs("error", service="payments-api", size=0) == []
+    assert tempo_traces.search_traces(service="payments-api", limit=0) == []
     assert k8s_readonly.recent_warning_events("payments", limit=0) == []
     # regression: lines[-0:] is the whole list, so 0 returned every log line.
     assert k8s_readonly.get_pod_logs("payments-api-00", "payments", tail_lines=0) == ""
@@ -396,3 +422,302 @@ def _await_card(url: str, attempts: int = 50) -> None:
         except httpx.HTTPError:
             time.sleep(0.1)
     pytest.fail(f"agent card never came up at {url}")
+
+
+def test_telemetry_is_noop_when_unset_and_configures_otlp_when_set(monkeypatch):
+    """init_telemetry is a no-op by default and configures OTLP gRPC/HTTP when set."""
+    from common import telemetry
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_PROTOCOL", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    assert telemetry.init_telemetry("observer") is False
+
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://otel-collector.kube-tracing.svc.cluster.local:4317",
+    )
+    assert telemetry.init_telemetry("observer") is True
+    provider = telemetry.current_tracer_provider()
+    assert provider is not None
+    assert provider.resource.attributes.get("service.name") == "observer"
+    provider.shutdown()
+
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://otel-collector.kube-tracing.svc.cluster.local:4318",
+    )
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "custom-observer")
+    assert telemetry.init_telemetry("observer") is True
+    provider_http = telemetry.current_tracer_provider()
+    assert provider_http is not None
+    assert provider_http.resource.attributes.get("service.name") == "custom-observer"
+    provider_http.shutdown()
+    telemetry.set_tracer_provider_for_testing(None)
+
+
+def test_a2a_round_trip_propagates_w3c_traceparent():
+    """call_agent injects W3C traceparent and build_app extracts it into the server span."""
+    from a2a.helpers import new_task_from_user_message
+    from a2a.server.agent_execution import AgentExecutor
+    from a2a.server.tasks import TaskUpdater
+    from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill, Part
+    from a2a.utils import TransportProtocol
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from agents.a2a_app import build_app, call_agent
+    from common import telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    telemetry.set_tracer_provider_for_testing(provider)
+
+    seen_server_trace_ids: list[str] = []
+
+    class TraceEchoExecutor(AgentExecutor):
+        async def execute(self, context, event_queue):
+            span_ctx = trace.get_current_span().get_span_context()
+            seen_server_trace_ids.append(f"{span_ctx.trace_id:032x}")
+            task = context.current_task
+            if task is None:
+                task = new_task_from_user_message(context.message)
+                await event_queue.enqueue_event(task)
+            updater = TaskUpdater(event_queue, task.id, task.context_id)
+            await updater.start_work()
+            await updater.add_artifact(
+                [Part(text=f"traced:{span_ctx.trace_id:032x}")], name="report"
+            )
+            await updater.complete()
+
+        async def cancel(self, context, event_queue):
+            pass
+
+    card = AgentCard(
+        name="TraceEcho",
+        description="test",
+        version="1.0.0",
+        default_input_modes=["text/plain"],
+        default_output_modes=["text/plain"],
+        capabilities=AgentCapabilities(streaming=True),
+        supported_interfaces=[
+            AgentInterface(url="http://127.0.0.1:9396", protocol_binding=TransportProtocol.JSONRPC)
+        ],
+        skills=[AgentSkill(id="echo", name="Echo", description="echo", tags=["t"])],
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            build_app(card, TraceEchoExecutor(), service="trace-echo"),
+            host="127.0.0.1",
+            port=9396,
+            log_level="warning",
+        )
+    )
+    threading.Thread(target=server.run, daemon=True).start()
+    try:
+        _await_card("http://127.0.0.1:9396/.well-known/agent-card.json")
+        with telemetry.get_tracer("test").start_as_current_span("root-incident") as root_span:
+            expected_tid = f"{root_span.get_span_context().trace_id:032x}"
+            res = asyncio.run(call_agent("http://127.0.0.1:9396", "ping"))
+        assert res == f"traced:{expected_tid}"
+        assert seen_server_trace_ids == [expected_tid]
+        spans = exporter.get_finished_spans()
+        span_names = {s.name for s in spans}
+        assert {"root-incident", "a2a.call_agent", "a2a.request"} <= span_names
+    finally:
+        server.should_exit = True
+        provider.shutdown()
+        telemetry.set_tracer_provider_for_testing(None)
+
+
+def test_traced_tool_records_tool_name_and_status_without_leaking_arguments():
+    """MCP tools emit spans with tool name and status, never raw arguments or secrets."""
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+
+    from common import telemetry
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    telemetry.set_tracer_provider_for_testing(provider)
+    try:
+        loki_logs.search_logs("sensitive-prompt-token", service="payments-api")
+        with pytest.raises(ValueError, match="hexadecimal"):
+            tempo_traces.get_trace("not-hex")
+
+        spans = {s.name: s for s in exporter.get_finished_spans()}
+        ok_span = spans["mcp.tool.search_logs"]
+        assert ok_span.attributes["mcp.tool.name"] == "search_logs"
+        assert ok_span.attributes["mcp.tool.status"] == "ok"
+        assert ok_span.status.status_code == StatusCode.OK
+        assert "sensitive-prompt-token" not in str(dict(ok_span.attributes))
+
+        err_span = spans["mcp.tool.get_trace"]
+        assert err_span.attributes["mcp.tool.name"] == "get_trace"
+        assert err_span.attributes["mcp.tool.status"] == "error"
+        assert err_span.status.status_code == StatusCode.ERROR
+        assert "not-hex" not in str(dict(err_span.attributes))
+    finally:
+        provider.shutdown()
+        telemetry.set_tracer_provider_for_testing(None)
+
+
+def test_real_loki_logs_queries_gateway_with_basic_auth_and_extracts_trace_id(monkeypatch):
+    """RealLogs queries /loki/api/v1/query_range, attaches basic auth, and extracts trace_id."""
+    from mcp_servers.backends.real import RealLogs
+
+    monkeypatch.setenv("LOKI_URL", "http://loki-gateway.kube-logcollect.svc.cluster.local")
+    monkeypatch.setenv("LOKI_USERNAME", "loki-user")
+    monkeypatch.setenv("LOKI_PASSWORD", "loki-pass")
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url.copy_with(query=None))
+        seen["params"] = dict(request.url.params)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {
+                            "stream": {
+                                "pod_name": "payments-api-00",
+                                "namespace_name": "payments",
+                                "level": "error",
+                            },
+                            "values": [
+                                [
+                                    "1700000000000000000",
+                                    '{"message":"connection pool exhausted","level":"ERROR",'
+                                    '"trace_id":"0123456789abcdef0123456789abcdef"}',
+                                ]
+                            ],
+                        }
+                    ],
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    orig_client = httpx.Client
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return orig_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", patched_client)
+    docs = RealLogs().search("pool exhausted", service="payments-api", size=10)
+    assert seen["url"] == (
+        "http://loki-gateway.kube-logcollect.svc.cluster.local/loki/api/v1/query_range"
+    )
+    assert seen["auth"] and seen["auth"].startswith("Basic ")
+    assert "payments-api" in seen["params"]["query"]
+    assert "pool" in seen["params"]["query"] and "exhausted" in seen["params"]["query"]
+    assert len(docs) == 1
+    assert docs[0]["service"] == "payments-api-00"
+    assert docs[0]["level"] == "ERROR"
+    assert docs[0]["message"] == "connection pool exhausted"
+    assert docs[0]["trace_id"] == "0123456789abcdef0123456789abcdef"
+
+
+def test_real_tempo_traces_search_and_get_trace(monkeypatch):
+    """RealTraces queries Tempo /api/search and /api/traces/<trace_id>."""
+    from mcp_servers.backends.real import RealTraces
+
+    monkeypatch.setenv("TEMPO_URL", "http://tempo.kube-tracing.svc.cluster.local:3200")
+    trace_id = "0123456789abcdef0123456789abcdef"
+    requests_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request.url.path)
+        if request.url.path == "/api/search":
+            assert 'resource.service.name = "payments-api"' in request.url.params["q"]
+            assert "status = error" in request.url.params["q"]
+            return httpx.Response(
+                200,
+                json={
+                    "traces": [
+                        {
+                            "traceID": trace_id,
+                            "rootServiceName": "payments-api",
+                            "rootTraceName": "POST /charge",
+                            "startTimeUnixNano": "1700000000000000000",
+                            "durationMs": 812,
+                            "spanSets": [
+                                {"spans": [{"spanID": "a" * 16, "status": {"code": "error"}}]}
+                            ],
+                        }
+                    ]
+                },
+            )
+        if request.url.path == f"/api/traces/{trace_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "batches": [
+                        {
+                            "resource": {
+                                "attributes": [
+                                    {
+                                        "key": "service.name",
+                                        "value": {"stringValue": "payments-api"},
+                                    }
+                                ]
+                            },
+                            "scopeSpans": [
+                                {
+                                    "spans": [
+                                        {
+                                            "spanId": "1111111111111111",
+                                            "name": "POST /charge",
+                                            "startTimeUnixNano": "1700000000000000000",
+                                            "endTimeUnixNano": "1700000000812000000",
+                                            "status": {
+                                                "code": "STATUS_CODE_ERROR",
+                                                "message": "OOMKilled",
+                                            },
+                                            "attributes": [
+                                                {
+                                                    "key": "k8s.pod.name",
+                                                    "value": {"stringValue": "payments-api-00"},
+                                                }
+                                            ],
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    orig_client = httpx.Client
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return orig_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", patched_client)
+    backend = RealTraces()
+    summaries = backend.search_traces(service="payments-api", status="error", limit=5)
+    assert len(summaries) == 1
+    assert summaries[0]["trace_id"] == trace_id
+    assert summaries[0]["status"] == "error"
+
+    detail = backend.get_trace(trace_id)
+    assert detail["trace_id"] == trace_id
+    assert detail["status"] == "error"
+    assert detail["spans"][0]["attributes"]["k8s.pod.name"] == "payments-api-00"
+    assert requests_seen == ["/api/search", f"/api/traces/{trace_id}"]

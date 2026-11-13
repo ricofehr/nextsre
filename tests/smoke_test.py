@@ -25,19 +25,24 @@ os.environ["DEMO_MODE"] = "1"
 
 
 def check_read_tools() -> None:
-    from mcp_servers import demo_state, es_logs, k8s_readonly, prometheus_alerts
+    from mcp_servers import demo_state, k8s_readonly, loki_logs, prometheus_alerts, tempo_traces
 
     demo_state.reset()
     pods = k8s_readonly.list_pods("payments")
     assert pods and all(p["reason"] == "CrashLoopBackOff" for p in pods), pods
     assert "OOMKilled" in k8s_readonly.get_pod_logs("payments-api-00", "payments")
     assert any(a["severity"] == "critical" for a in prometheus_alerts.active_alerts("warning"))
-    assert any(d["level"] == "ERROR" for d in es_logs.search_logs("error", service="payments-api"))
+    docs = loki_logs.search_logs("error", service="payments-api")
+    assert any(d["level"] == "ERROR" for d in docs)
+    trace_id = docs[0]["trace_id"]
+    traces = tempo_traces.search_traces(service="payments-api", status="error")
+    assert any(t["trace_id"] == trace_id for t in traces)
+    assert tempo_traces.get_trace(trace_id)["status"] == "error"
     print("✓ read tools report the incident")
 
 
 def check_recovery_loop() -> None:
-    from mcp_servers import demo_state, k8s_readonly, k8s_write
+    from mcp_servers import demo_state, k8s_readonly, k8s_write, tempo_traces
 
     demo_state.reset()
     assert all(not p["ready"] for p in k8s_readonly.list_pods("payments"))
@@ -49,6 +54,7 @@ def check_recovery_loop() -> None:
         for a in demo_state.load()["alerts"]
         if a["service"] == "payments-api"
     )
+    assert tempo_traces.search_traces(service="payments-api", status="error") == []
     print("✓ restart resolves the incident; read side confirms recovery")
 
 

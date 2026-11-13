@@ -24,6 +24,7 @@ from mcp.server.mcpserver import MCPServer
 
 from common.env import env_csv, env_flag, env_int
 from common.serving import bind_host, port, transport_security
+from common.telemetry import init_telemetry, traced_tool
 
 from . import backends
 
@@ -76,6 +77,7 @@ def _guard_target(name: str, namespace: str) -> None:
 
 
 @mcp.tool()
+@traced_tool
 def restart_deployment(name: str, namespace: str) -> dict:
     """Rolling-restart a deployment. Reversible, zero-downtime. Resolves crash loops."""
     _guard_target(name, namespace)
@@ -84,6 +86,7 @@ def restart_deployment(name: str, namespace: str) -> dict:
 
 
 @mcp.tool()
+@traced_tool
 def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
     """Scale a deployment. Hard-capped at MAX_REPLICAS by the harness."""
     _guard_target(name, namespace)
@@ -99,6 +102,7 @@ def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
+    init_telemetry("k8s-write")
     mcp.run(
         transport="streamable-http",
         host=bind_host(),

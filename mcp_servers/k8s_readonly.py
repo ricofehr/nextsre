@@ -13,6 +13,7 @@ from mcp.server.mcpserver import MCPServer
 
 from common.env import env_flag
 from common.serving import bind_host, port, transport_security
+from common.telemetry import init_telemetry, traced_tool
 
 from . import backends
 
@@ -23,18 +24,21 @@ MAX_EVENTS = 200
 
 
 @mcp.tool()
+@traced_tool
 def list_pods(namespace: str = "payments") -> list[dict]:
     """List pods in a namespace with phase, readiness and restart counts."""
     return backends.k8s_read().list_pods(namespace)
 
 
 @mcp.tool()
+@traced_tool
 def get_pod_logs(name: str, namespace: str = "payments", tail_lines: int = 50) -> str:
     """Fetch recent logs for a single pod."""
     return backends.k8s_read().pod_logs(name, namespace, _clamp(tail_lines, MAX_TAIL_LINES))
 
 
 @mcp.tool()
+@traced_tool
 def recent_warning_events(namespace: str = "payments", limit: int = 20) -> list[dict]:
     """Recent Warning-type events (OOMKilled, FailedScheduling, ...)."""
     return backends.k8s_read().warning_events(namespace, _clamp(limit, MAX_EVENTS))
@@ -47,6 +51,7 @@ def _clamp(value: int, ceiling: int) -> int:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
+    init_telemetry("k8s-ro")
     mcp.run(
         transport="streamable-http",
         host=bind_host(),

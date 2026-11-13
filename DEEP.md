@@ -4,27 +4,27 @@
 
 ## Big Picture
 
-NextSRE is a multi-agent incident-response system built on a deliberate privilege split. A **read-only Observer** investigates a reported incident by gathering evidence from Kubernetes, Prometheus alerts, and Elasticsearch, then decides whether a remediation is warranted. If it is, the Observer hands a single, precise instruction to a **write-capable Operator** over the **A2A (Agent-to-Agent) protocol**. The Operator re-evaluates that instruction against its own policy harness and executes it if safe.
+NextSRE is a multi-agent incident-response system built on a deliberate privilege split. A **read-only Observer** investigates a reported incident by gathering evidence from Kubernetes, Prometheus alerts, Grafana Loki logs, and Grafana Tempo distributed traces, then decides whether a remediation is warranted. If it is, the Observer hands a single, precise instruction to a **write-capable Operator** over the **A2A (Agent-to-Agent) protocol**. The Operator re-evaluates that instruction against its own policy harness and executes it if safe.
 
 The privilege boundary is physical, not just conventional. The Observer process has zero write tools — it cannot mutate infrastructure even if the LLM is manipulated. The Operator has write tools but its MCP servers enforce hard policy (namespace allowlists, replica caps, binary allowlists) that rejects violations before any mutation reaches the cluster, independent of the LLM's judgment. A third optional layer — an ADK human-approval confirmation gate (`require_confirmation=True`) — can pause execution before writes if `REQUIRE_APPROVAL=1`.
 
-Both agents are stateless HTTP services. All tools come from external MCP servers they connect to at startup, so the tool surface can be audited, versioned, and swapped without touching agent code. A synthetic demo mode (`DEMO_MODE=1`, the default) provides a shared JSON cluster state across all five MCP servers, enabling full end-to-end runs without real infrastructure or a cloud LLM.
+Both agents are stateless HTTP services. All tools come from external MCP servers they connect to at startup, so the tool surface can be audited, versioned, and swapped without touching agent code. A synthetic demo mode (`DEMO_MODE=1`, the default) provides a shared JSON cluster state across all six MCP servers, enabling full end-to-end runs without real infrastructure or a cloud LLM.
 
 ```
 fire_incident.py
-      │  A2A JSON-RPC (port 9300)
+      │  A2A JSON-RPC (port 9300, W3C traceparent)
       ▼
-┌─────────────────────────────────────┐
-│  Observer (Google ADK LlmAgent)     │  read MCP tools only
-│   k8s-ro · prom-alerts · es-logs    │
-└──────────┬──────────────────────────┘
+┌───────────────────────────────────────────────────┐
+│  Observer (Google ADK LlmAgent)                   │  read MCP tools only
+│   k8s-ro · prom-alerts · loki-logs · tempo-traces │
+└──────────┬────────────────────────────────────────┘
            │  request_remediation()
-           │  A2A JSON-RPC (port 9301)
+           │  A2A JSON-RPC (port 9301, W3C traceparent)
            ▼
-┌─────────────────────────────────────┐
-│  Operator (Google ADK LlmAgent)     │  write MCP tools + harness
-│   k8s-write · shell-exec            │
-└─────────────────────────────────────┘
+┌───────────────────────────────────────────────────┐
+│  Operator (Google ADK LlmAgent)                   │  write MCP tools + harness
+│   k8s-write · shell-exec                          │
+└───────────────────────────────────────────────────┘
 ```
 
 ---
@@ -33,19 +33,20 @@ fire_incident.py
 
 **Entry point:** `agents/observer/server.py` → `agents/observer/observer_agent.py`
 
-The Observer is an ADK `LlmAgent` that loads three read-only MCP servers as its tool surface (`McpToolset`) and one synthetic write tool (`request_remediation`) that actually crosses the network to the Operator.
+The Observer is an ADK `LlmAgent` that loads four read-only MCP servers as its tool surface (`McpToolset`) and one synthetic write tool (`request_remediation`) that actually crosses the network to the Operator.
 
 ### Tool surface
 
-At startup `build_observer()` creates three `McpToolset` instances connecting to:
+At startup `build_observer()` creates four `McpToolset` instances connecting to:
 
 | Logical name | Default URL | Provides |
 |---|---|---|
 | `k8s_ro` | `http://localhost:8101/mcp` | `list_pods`, `get_pod_logs`, `recent_warning_events` |
 | `prometheus_alerts` | `http://localhost:8102/mcp` | `active_alerts`, `query_metric` |
-| `es_logs` | `http://localhost:8103/mcp` | `search_logs` |
+| `loki_logs` | `http://localhost:8103/mcp` | `search_logs` |
+| `tempo_traces` | `http://localhost:8104/mcp` | `search_traces`, `get_trace` |
 
-All three URLs are overridable via `K8S_RO_URL`, `PROMETHEUS_ALERTS_URL`, `ES_LOGS_URL`.
+All four URLs are overridable via `K8S_RO_URL`, `PROMETHEUS_ALERTS_URL`, `LOKI_LOGS_URL`, `TEMPO_TRACES_URL`.
 
 ### Investigation loop
 
@@ -72,7 +73,7 @@ async def _request_remediation(action: str) -> str:
 request_remediation = FunctionTool(_request_remediation)
 ```
 
-The Observer never sees write MCP tools. Its tool list at runtime is exactly the three MCP toolsets plus this one bridge.
+The Observer never sees write MCP tools. Its tool list at runtime is exactly the four MCP toolsets plus this one bridge.
 
 ### Agent card (`agents/observer/card.py`)
 
@@ -237,7 +238,7 @@ agent = build_adk_agent(
 
 ### Architecture pattern
 
-Each MCP server is a standalone Python module that calls `mcp.server.mcpserver.MCPServer` to register tools and runs a Starlette ASGI app on a dedicated port. All five are built from the same Dockerfile and differ only in their tool definitions and environment configuration.
+Each MCP server is a standalone Python module that calls `mcp.server.mcpserver.MCPServer` to register tools and runs a Starlette ASGI app on a dedicated port. All six are built from the same Dockerfile and differ only in their tool definitions and environment configuration.
 
 ```python
 from common.serving import bind_host, port, transport_security
@@ -264,7 +265,7 @@ if __name__ == "__main__":
 
 ### Demo state (`mcp_servers/demo_state.py`)
 
-The synthetic cluster is a single JSON file shared across all five MCP server processes via `DEMO_STATE_FILE`. Reads and writes go through `load()` and `update(mutator)` which acquire both an in-process `threading.Lock` and an advisory cross-process `fcntl.flock` lock file, writing atomically via `tempfile + os.replace` to avoid partial reads or lost updates.
+The synthetic cluster is a single JSON file shared across all six MCP server processes via `DEMO_STATE_FILE`. Reads and writes go through `load()` and `update(mutator)` which acquire both an in-process `threading.Lock` and an advisory cross-process `fcntl.flock` lock file, writing atomically via `tempfile + os.replace` to avoid partial reads or lost updates.
 
 The seed state encodes a real-looking incident: `payments-api` in `CrashLoopBackOff` with 47 restarts and `OOMKilled` as the last error, plus a critical alert and a DB connection pool saturation warning. When `restart_deployment` runs in demo mode it calls `update()` to flip `healthy=True` and clear `reason` and `last_error` — the read tools will then report a healthy deployment, confirming recovery.
 
@@ -284,11 +285,17 @@ In demo mode returns `state["alerts"]` filtered by severity and synthesizes metr
 
 Tools: `active_alerts(min_severity)`, `query_metric(query)`.
 
-**`es_logs.py` (port 8103)**
+**`loki_logs.py` (port 8103)**
 
-In demo mode synthesizes log entries: healthy deployments emit info messages; unhealthy ones emit OOMKilled errors and crash messages. In real mode issues a `_search` against the `logs-*` index pattern bounded by a time range, using `multi_match` over `["message", "level"]` — deliberately *not* `query_string`, whose operators would let LLM-authored text (derived from attacker-influenceable logs) reach fields this tool must not expose. `""` and `"*"` are special-cased to `match_all`, matching the demo backend. `size` and `minutes` are clamped in `es_logs.py` before the backend is called.
+In demo mode synthesizes log entries with correlated 32-hex `trace_id` values: healthy deployments emit info messages; unhealthy ones emit OOMKilled errors and crash messages. In real mode queries Grafana Loki's `/loki/api/v1/query_range` HTTP API (`LOKI_URL`, plus optional `LOKI_USERNAME` / `LOKI_PASSWORD` basic auth) using `build_logql(query, service)`, which escapes double quotes and regex characters so LLM-authored arguments cannot inject LogQL pipeline stages. Structured JSON log lines (Fluent Bit / OTLP) and regex `trace_id` tokens are parsed into `{@timestamp, service, level, message, trace_id}`. `size` and `minutes` are clamped in `loki_logs.py` before the backend is called.
 
 Tool: `search_logs(query, service, minutes, size)`.
+
+**`tempo_traces.py` (port 8104)**
+
+In demo mode synthesizes distributed traces matching the deterministic `trace_id` values emitted by `DemoLogs` and `DemoK8sRead.pod_logs`: unhealthy deployments return `status="error"` traces and error spans; healthy deployments return `status="ok"` traces. In real mode queries Grafana Tempo's HTTP API (`TEMPO_URL`): `GET /api/search` using `build_traceql(service, min_duration_ms, status)` with escaped string literals and validated status values, and `GET /api/traces/<trace_id>` after verifying `trace_id` is a 16- or 32-character hexadecimal string (preventing path traversal).
+
+Tools: `search_traces(service, min_duration_ms, status, minutes, limit)`, `get_trace(trace_id)`.
 
 ### Write servers
 
@@ -361,4 +368,4 @@ NextSRE uses `google-adk[a2a,mcp,openai]` across all three agent layers:
 1. **Agent orchestration (`common/llm.py`)**: Both Observer and Operator are ADK `LlmAgent` instances backed by `OpenAILlm` (`google.adk.integrations.openai`) pointed at the local OpenAI-compatible inference server (`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`).
 2. **A2A server execution (`agents/a2a_app.py`)**: `ADKExecutor` wraps ADK's `A2aAgentExecutor` and `InMemoryRunner` with single-flight lazy initialization (`asyncio.Lock`) and sanitized error reporting, served behind Starlette's `TrustedHostMiddleware`.
 3. **MCP toolsets & confirmation gate (`agents/observer/`, `agents/operator/`)**: Tools are loaded via `McpToolset(connection_params=StreamableHTTPConnectionParams(url=...))`. When `REQUIRE_APPROVAL=1`, the Operator passes `require_confirmation=True` to its MCP toolsets so ADK pauses before executing any write tool.
-4. **Framework-independent MCP servers (`mcp_servers/`)**: The five MCP servers, demo state (`demo_state.py`), `docker-compose.yml` topology, and three-layer harness remain completely decoupled from the agent framework.
+4. **Framework-independent MCP servers (`mcp_servers/`)**: The six MCP servers, demo state (`demo_state.py`), `docker-compose.yml` topology, OpenTelemetry instrumentation (`common/telemetry.py`), and three-layer harness remain completely decoupled from the agent framework.

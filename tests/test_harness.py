@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import pytest
 
+from common import telemetry
 from common.env import env_csv, env_flag, env_int
-from mcp_servers import k8s_write, shell_exec
+from mcp_servers import k8s_write, shell_exec, tempo_traces
+from mcp_servers.backends.real import build_logql, build_traceql
 
 
 # --------------------------------------------------------------------------- #
@@ -290,3 +292,55 @@ def test_max_replicas_is_read_at_call_time(monkeypatch):
     monkeypatch.setenv("MAX_REPLICAS", "2")
     with pytest.raises(ValueError):
         k8s_write.scale_deployment("web", "web", 5)
+
+
+# --------------------------------------------------------------------------- #
+#  Loki LogQL / Tempo TraceQL / trace_id / OTel config hardening
+# --------------------------------------------------------------------------- #
+def test_logql_escapes_quotes_and_pipeline_injection():
+    """Untrusted service or query strings cannot inject unescaped LogQL operators."""
+    expr = build_logql('error" | line_format "{{.secret}}"', service='payments" |= "x')
+    # Every embedded double quote inside the user-supplied strings is backslash-escaped.
+    assert 'payments\\" |= \\"x' in expr
+    assert '|~ "(?i)' in expr
+    assert 'line_format\\\\ \\"\\\\{\\\\{\\\\.secret\\\\}\\\\}\\""' in expr
+
+
+def test_traceql_escapes_service_and_validates_status():
+    """Untrusted service names cannot break out of TraceQL string literals."""
+    expr = build_traceql(service='payments" || true', status="error", min_duration_ms=250)
+    assert 'resource.service.name = "payments\\" || true"' in expr
+    assert "status = error" in expr
+    assert "duration >= 250ms" in expr
+
+    with pytest.raises(ValueError, match="invalid trace status"):
+        build_traceql(status="error || status = ok")
+
+
+@pytest.mark.parametrize(
+    "bad_trace_id",
+    [
+        "",
+        "../../api/echo",
+        "0123456789abcdef0123456789abcdeg",  # non-hex 'g'
+        "0123456789abcde",  # 15 chars, neither 16 nor 32
+        "0123456789abcdef0123456789abcdef/../../secret",
+    ],
+)
+def test_tempo_get_trace_rejects_non_hex_or_path_traversal_trace_id(bad_trace_id):
+    with pytest.raises(ValueError, match="hexadecimal"):
+        tempo_traces.get_trace(bad_trace_id)
+
+
+def test_telemetry_rejects_invalid_protocol_and_endpoint_scheme(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "file:///etc/passwd")
+    with pytest.raises(ValueError, match="must use http\\(s\\) or host:port"):
+        telemetry.init_telemetry("observer")
+
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://otel-collector.kube-tracing.svc.cluster.local:4317",
+    )
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "websocket")
+    with pytest.raises(ValueError, match="OTEL_EXPORTER_OTLP_PROTOCOL"):
+        telemetry.init_telemetry("observer")

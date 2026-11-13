@@ -9,7 +9,7 @@ def observer_card() -> AgentCard:
     return AgentCard(
         name="SRE Observer",
         description="Read-only SRE agent. Investigates incidents across Kubernetes, "
-        "Prometheus alerts and Elasticsearch logs, then delegates any fix.",
+        "Prometheus alerts, Grafana Loki logs, and Grafana Tempo traces, then delegates any fix.",
         version="1.0.0",
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],
@@ -19,8 +19,8 @@ def observer_card() -> AgentCard:
             AgentSkill(
                 id="investigate",
                 name="Incident investigation",
-                description="Diagnose an incident from cluster state, alerts and logs; "
-                "propose and (via the operator) apply a remediation.",
+                description="Diagnose an incident from cluster state, alerts, Loki logs, and "
+                "Tempo distributed traces; propose and (via the operator) apply a remediation.",
                 tags=["sre", "read-only", "diagnosis"],
                 examples=[
                     "investigate the active incident and remediate if safe",

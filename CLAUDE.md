@@ -21,7 +21,7 @@ python -m scripts.fire_incident
 ```
 
 ### Run (without Docker)
-Start each service in a separate terminal — 5 MCP servers on ports 8101–8103 and 8201–8202, then Observer on 9300 and Operator on 9301. See `docker-compose.yml` for the exact commands and env vars.
+Start each service in a separate terminal — 6 MCP servers on ports 8101–8104 and 8201–8202, then Observer on 9300 and Operator on 9301. See `docker-compose.yml` for the exact commands and env vars.
 
 ### Test
 ```bash
@@ -51,17 +51,21 @@ length 100.
 - **`agents/a2a_app.py`** — shared infrastructure: Starlette app builder, `ADKExecutor` (bridges ADK's `A2aAgentExecutor` and `InMemoryRunner` with single-flight lazy initialization and sanitized failure messages), and `call_agent` A2A client helper.
 
 ### MCP Servers (`mcp_servers/`)
-Five independent HTTP MCP servers provide all tools. Agents load tools via ADK `McpToolset` (`StreamableHTTPConnectionParams`).
+Six independent HTTP MCP servers provide all tools. Agents load tools via ADK `McpToolset` (`StreamableHTTPConnectionParams`).
 
 | Server | Port | Access |
 |---|---|---|
 | `k8s_readonly.py` | 8101 | Observer |
 | `prometheus_alerts.py` | 8102 | Observer |
-| `es_logs.py` | 8103 | Observer |
+| `loki_logs.py` | 8103 | Observer |
+| `tempo_traces.py` | 8104 | Observer |
 | `k8s_write.py` | 8201 | Operator |
 | `shell_exec.py` | 8202 | Operator |
 
 `demo_state.py` is a shared module (not a server) providing thread-safe, atomic-write JSON state used by all servers in demo mode.
+
+### OpenTelemetry Self-Instrumentation (`common/telemetry.py`)
+Setting `OTEL_EXPORTER_OTLP_ENDPOINT` (and optional `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_SERVICE_NAME`) enables OTLP span export across both A2A agents and all MCP servers, with W3C `traceparent` propagation across `call_agent` → `build_app` and outbound backend HTTP requests. Leaving `OTEL_EXPORTER_OTLP_ENDPOINT` unset is a strict no-op.
 
 ### Defense-in-Depth Harness (Operator)
 Three independent layers prevent unsafe mutations:
@@ -73,7 +77,7 @@ Three independent layers prevent unsafe mutations:
 Both agents use Google ADK's `OpenAILlm` (`google.adk.integrations.openai`) configured as an OpenAI-compatible client (`common/llm.py`) pointing to a local Ollama or llama-server instance — not a cloud API. Set `LLM_BASE_URL` and `LLM_MODEL` in `.env`.
 
 ### Demo Mode
-`DEMO_MODE=1` enables a fully synthetic incident: `demo_state.py` maintains fake cluster state in a shared JSON file (path set by `DEMO_STATE_FILE`). All five MCP servers read/write this file so the incident progresses realistically without real infrastructure.
+`DEMO_MODE=1` enables a fully synthetic incident: `demo_state.py` maintains fake cluster state in a shared JSON file (path set by `DEMO_STATE_FILE`). All six MCP servers read/write this file so the incident progresses realistically without real infrastructure.
 
 ### A2A Protocol
 Uses A2A SDK 1.x (proto-based). The `fire_incident.py` script sends a JSON-RPC task to the Observer and streams status updates until the incident is resolved. The pinned dependency versions in `pyproject.toml` are load-bearing — A2A 1.x and 0.x are not compatible.

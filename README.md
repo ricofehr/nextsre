@@ -4,7 +4,8 @@ Two SRE agents that split investigation from action across a **privilege
 boundary**:
 
 - **Observer** (read-only) investigates an incident using Kubernetes,
-  Prometheus alerts, and Elasticsearch logs. It has **no write tools**.
+  Prometheus alerts, Grafana Loki logs, and Grafana Tempo distributed traces.
+  It has **no write tools**.
 - **Operator** (write) executes remediation on Kubernetes and hosts, behind a
   **policy harness**.
 
@@ -14,19 +15,20 @@ re-validates every action against its own harness. A2A turns the read/write
 split into a real process/network boundary, not a convention.
 
 ```
-                 A2A (delegation)
-  Observer  ───────────────────────►  Operator
- (read-only)                          (write + harness)
-   │ MCP                                  │ MCP
-   ▼                                      ▼
- K8s(read) · Prometheus alerts · ES logs   K8s(write) · Shell exec
+                 A2A (delegation + W3C traceparent)
+  Observer  ───────────────────────────────────────►  Operator
+ (read-only)                                         (write + harness)
+   │ MCP                                                 │ MCP
+   ▼                                                     ▼
+ K8s(read) · Prometheus alerts · Loki logs · Tempo     K8s(write) · Shell exec
 ```
 
 Each agent is a **Google ADK** (`LlmAgent`) agent driven by a **local, OpenAI-compatible
 LLM** (Ollama or `llama.cpp`'s `llama-server` via `google-adk[openai]`). Tools come from
 **MCP servers** loaded via ADK's `McpToolset`. Agent-to-agent communication uses the
 **A2A protocol** (`a2a-sdk` 1.x), with the Operator streaming a Task lifecycle
-(status updates + a final report artifact).
+(status updates + a final report artifact) and propagating W3C `traceparent`
+headers for end-to-end OpenTelemetry tracing.
 
 ## What's in the box
 
@@ -34,12 +36,14 @@ LLM** (Ollama or `llama.cpp`'s `llama-server` via `google-adk[openai]`). Tools c
 |---|---|
 | `mcp_servers/k8s_readonly.py` | read pods, logs, warning events |
 | `mcp_servers/prometheus_alerts.py` | active alerts, PromQL metric query |
-| `mcp_servers/es_logs.py` | search recent logs |
+| `mcp_servers/loki_logs.py` | search recent Grafana Loki logs (with `trace_id` extraction) |
+| `mcp_servers/tempo_traces.py` | search Grafana Tempo traces (`search_traces`) and inspect trace spans (`get_trace`) |
 | `mcp_servers/k8s_write.py` | restart/scale deployments — **harness: namespace allowlist + replica cap + name validation** |
 | `mcp_servers/shell_exec.py` | run host commands — **harness: binary allowlist + per-binary non-destructive verb allowlist + token denylist** |
 | `mcp_servers/backends/` | demo vs real adapters behind a port per domain; selection is lazy, so the tools stay importable and testable |
 | `mcp_servers/demo_state.py` | shared synthetic "cluster" so the demo runs without real infra |
 | `common/env.py` | fail-closed env parsing — an unrecognised `DEMO_MODE` raises instead of quietly meaning "not demo" |
+| `common/telemetry.py` | opt-in OpenTelemetry OTLP span export (`OTEL_EXPORTER_OTLP_ENDPOINT`) + W3C `traceparent` propagation |
 | `agents/observer/` | read agent: card, MCP read tools, the A2A `request_remediation` delegate tool |
 | `agents/operator/` | write agent: card, MCP write tools, optional human approval gate |
 | `agents/a2a_app.py` | shared: Starlette app builder, ADK→A2A streaming executor, A2A client helper |
@@ -49,10 +53,11 @@ LLM** (Ollama or `llama.cpp`'s `llama-server` via `google-adk[openai]`). Tools c
 ## Demo mode (default)
 
 `DEMO_MODE=1` makes the MCP servers serve a synthetic incident: `payments-api`
-is in `CrashLoopBackOff` (OOMKilled). The read servers report it; the write
+is in `CrashLoopBackOff` (OOMKilled). The read servers report it (including
+correlated `trace_id` values across Loki logs and Tempo error traces); the write
 server's `restart_deployment` flips the shared state to healthy and resolves
 the alert — so the Observer's verification re-read actually sees recovery.
-No Kubernetes, Prometheus, or Elasticsearch required.
+No Kubernetes, Prometheus, Loki, or Tempo required.
 
 `DEMO_MODE` is parsed strictly: `1/0/true/false/yes/no/on/off` are accepted and
 anything else raises — at startup for the MCP servers, and again before any tool
@@ -81,7 +86,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Seven containers start: five MCP servers plus the two agents. Only the Observer
+Eight containers start: six MCP servers plus the two agents. Only the Observer
 is published, on `localhost:9300`; everything else is reachable on the compose
 network only (see [Network boundary](#network-boundary)).
 
@@ -111,13 +116,14 @@ as it gathers evidence and delegates the fix, then a final incident report.
 
 ## Run without Docker
 
-In seven terminals (or use `&`), with the venv active and `.env` exported. Every
+In eight terminals (or use `&`), with the venv active and `.env` exported. Every
 service binds loopback here, so nothing is exposed to the network:
 
 ```bash
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.k8s_readonly   # :8101
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.prometheus_alerts  # :8102
-DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.es_logs        # :8103
+DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.loki_logs      # :8103
+DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.tempo_traces   # :8104
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.k8s_write      # :8201
 DEMO_STATE_FILE=/tmp/sre/state.json python -m mcp_servers.shell_exec     # :8202
 python -m agents.operator.server                                          # :9301
@@ -203,9 +209,15 @@ pip install ".[real]"
 
 Then provide credentials/config the real code paths expect: a kubeconfig or
 in-cluster service account (`kubernetes`), `ALERTMANAGER_URL` and `PROMETHEUS_URL`
-(`prometheus_alerts`), and `ES_URL` (`es_logs`). Keep the Operator's service account
-RBAC-scoped to exactly the verbs/namespaces its harness allows — the harness is
-your second line, RBAC is your first.
+(`prometheus_alerts`), `LOKI_URL` plus optional `LOKI_USERNAME`/`LOKI_PASSWORD`
+basic auth (`loki_logs`), and `TEMPO_URL` (`tempo_traces`). To export the
+agents' and MCP servers' own OpenTelemetry spans to the cluster's
+`otel-collector`, set `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g.
+`http://otel-collector.kube-tracing.svc.cluster.local:4317`) and optionally
+`OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc` or `http/protobuf`) and
+`OTEL_SERVICE_NAME`. Keep the Operator's service account RBAC-scoped to exactly
+the verbs/namespaces its harness allows — the harness is your second line, RBAC
+is your first.
 
 ## Notes / gotchas
 

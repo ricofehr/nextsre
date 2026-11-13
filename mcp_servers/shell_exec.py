@@ -37,6 +37,7 @@ from mcp.server.mcpserver import MCPServer
 
 from common.env import env_flag
 from common.serving import bind_host, port, transport_security
+from common.telemetry import init_telemetry, traced_tool
 
 mcp = MCPServer("shell-exec")
 
@@ -365,6 +366,7 @@ def _harness_check(command: str) -> list[str]:
 
 
 @mcp.tool()
+@traced_tool
 def run_command(command: str, timeout_s: int = 20) -> dict:
     """Run a vetted, non-destructive diagnostic shell command under the harness."""
     argv = _harness_check(command)
@@ -397,6 +399,7 @@ def run_command(command: str, timeout_s: int = 20) -> dict:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
+    init_telemetry("shell-exec")
     mcp.run(
         transport="streamable-http",
         host=bind_host(),
