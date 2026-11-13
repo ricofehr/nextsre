@@ -28,11 +28,12 @@ def test_observer_is_not_wired_to_any_write_server():
     assert "k8s_write" not in urls and "shell" not in toolsets
 
 
-def test_observer_reaches_all_three_read_servers():
+def test_observer_reaches_all_read_servers():
     assert set(observer_agent._mcp_toolsets()) == {
         "k8s_ro",
         "prometheus_alerts",
-        "es_logs",
+        "loki_logs",
+        "tempo_traces",
     }
 
 
@@ -60,10 +61,15 @@ def test_agent_urls_are_resolved_at_call_time(monkeypatch):
     from agents.observer import remediation_tool
 
     monkeypatch.setenv("K8S_RO_URL", "http://custom-k8s-ro:8101/mcp")
+    monkeypatch.setenv("LOKI_LOGS_URL", "http://custom-loki-logs:8103/mcp")
+    monkeypatch.setenv("TEMPO_TRACES_URL", "http://custom-tempo-traces:8104/mcp")
     monkeypatch.setenv("K8S_WRITE_URL", "http://custom-k8s-write:8201/mcp")
     monkeypatch.setenv("OPERATOR_URL", "http://custom-operator:9301")
 
-    assert "custom-k8s-ro" in _toolset_urls(observer_agent._mcp_toolsets())
+    observer_urls = _toolset_urls(observer_agent._mcp_toolsets())
+    assert "custom-k8s-ro" in observer_urls
+    assert "custom-loki-logs" in observer_urls
+    assert "custom-tempo-traces" in observer_urls
     assert "custom-k8s-write" in _toolset_urls(operator_agent._mcp_toolsets())
     assert remediation_tool._operator_url() == "http://custom-operator:9301"
 

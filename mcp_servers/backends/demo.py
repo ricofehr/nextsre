@@ -1,16 +1,23 @@
 """Demo adapters: serve the synthetic incident from the shared state file.
 
-All four adapters read (and the write one mutates) ``demo_state``, so the read
+All five adapters read (and the write one mutates) ``demo_state``, so the read
 servers observe whatever the write server just did - that shared file is what
 lets the Observer confirm its own remediation without a real cluster.
 """
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 
 from .. import demo_state
 from .ports import SEVERITY_ORDER
+
+
+def _demo_trace_id(dep: dict) -> str:
+    """Deterministic 32-hex trace_id shared between DemoLogs and DemoTraces."""
+    seed = f"{dep['namespace']}/{dep['name']}".encode("utf-8")
+    return hashlib.sha256(seed).hexdigest()[:32]
 
 
 class DemoK8sRead:
@@ -47,13 +54,14 @@ class DemoK8sRead:
         )
         if dep is None:
             return f"no logs: pod {name} not found in {namespace}"
+        trace_id = _demo_trace_id(dep)
         if dep["healthy"]:
-            lines = [f"INFO  request handled in {12 + i}ms" for i in range(5)]
+            lines = [f"INFO  trace_id={trace_id} request handled in {12 + i}ms" for i in range(5)]
         else:
             lines = [
                 "INFO  starting payments-api",
                 "INFO  connected to payments-db",
-                f"FATAL {dep['last_error']}",
+                f"FATAL trace_id={trace_id} {dep['last_error']}",
                 "INFO  container exited with code 137 (OOMKilled), restarting",
             ]
         # lines[-0:] is the whole list, so 0 has to be handled before slicing -
@@ -134,22 +142,133 @@ class DemoAlerts:
 
 class DemoLogs:
     def search(self, query: str, service: str | None, minutes: int, size: int) -> list[dict]:
+        if size <= 0 or minutes <= 0:
+            return []
         now = datetime.now(timezone.utc).isoformat()
         docs: list[dict] = []
         for dep in demo_state.load()["deployments"].values():
             if service and dep["name"] != service:
                 continue
+            tid = _demo_trace_id(dep)
             if dep["healthy"]:
-                docs.append(_doc(now, dep["name"], "INFO", "request handled ok"))
+                docs.append(_doc(now, dep["name"], "INFO", "request handled ok", tid))
             else:
                 docs += [
-                    _doc(now, dep["name"], "ERROR", dep["last_error"]),
-                    _doc(now, dep["name"], "WARN", "container restart (exit code 137)"),
+                    _doc(now, dep["name"], "ERROR", dep["last_error"], tid),
+                    _doc(now, dep["name"], "WARN", "container restart (exit code 137)", tid),
                 ]
         needle = query.strip().lower()
         matches_all = needle in ("", "*")
         docs = [d for d in docs if matches_all or needle in _haystack(d)]
         return docs[:size]
+
+
+class DemoTraces:
+    def search_traces(
+        self,
+        service: str | None,
+        min_duration_ms: int,
+        status: str | None,
+        minutes: int,
+        limit: int,
+    ) -> list[dict]:
+        if limit <= 0 or minutes <= 0:
+            return []
+        traces: list[dict] = []
+        for dep in demo_state.load()["deployments"].values():
+            if service and dep["name"] != service:
+                continue
+            tid = _demo_trace_id(dep)
+            if dep["healthy"]:
+                trace_status = "ok"
+                duration_ms = 18
+                root_span = f"GET /{dep['name']}/healthz"
+                error = ""
+            else:
+                trace_status = "error"
+                duration_ms = 1420
+                root_span = f"POST /{dep['name']}/checkout"
+                error = dep["last_error"]
+            if status and trace_status != status:
+                continue
+            if duration_ms < min_duration_ms:
+                continue
+            traces.append(
+                {
+                    "trace_id": tid,
+                    "root_service": dep["name"],
+                    "namespace": dep["namespace"],
+                    "root_span": root_span,
+                    "status": trace_status,
+                    "duration_ms": duration_ms,
+                    "error": error,
+                }
+            )
+        return traces[:limit]
+
+    def get_trace(self, trace_id: str) -> dict:
+        target = trace_id.lower()
+        for dep in demo_state.load()["deployments"].values():
+            tid = _demo_trace_id(dep)
+            if tid != target:
+                continue
+            if dep["healthy"]:
+                return {
+                    "trace_id": tid,
+                    "root_service": dep["name"],
+                    "namespace": dep["namespace"],
+                    "status": "ok",
+                    "spans": [
+                        {
+                            "span_id": tid[:16],
+                            "service": "traefik",
+                            "operation": f"GET /{dep['name']}/healthz",
+                            "duration_ms": 18,
+                            "status": "ok",
+                            "attributes": {},
+                        },
+                        {
+                            "span_id": tid[16:],
+                            "service": dep["name"],
+                            "operation": "handle_request",
+                            "duration_ms": 14,
+                            "status": "ok",
+                            "attributes": {
+                                "k8s.namespace.name": dep["namespace"],
+                                "k8s.pod.name": f"{dep['name']}-00",
+                            },
+                        },
+                    ],
+                }
+            return {
+                "trace_id": tid,
+                "root_service": dep["name"],
+                "namespace": dep["namespace"],
+                "status": "error",
+                "spans": [
+                    {
+                        "span_id": tid[:16],
+                        "service": "traefik",
+                        "operation": f"POST /{dep['name']}/checkout",
+                        "duration_ms": 1420,
+                        "status": "error",
+                        "attributes": {"http.Response.status_code": "502"},
+                    },
+                    {
+                        "span_id": tid[16:],
+                        "service": dep["name"],
+                        "operation": "process_payment",
+                        "duration_ms": 1405,
+                        "status": "error",
+                        "error": dep["last_error"],
+                        "attributes": {
+                            "k8s.namespace.name": dep["namespace"],
+                            "k8s.pod.name": f"{dep['name']}-00",
+                        },
+                    },
+                ],
+            }
+        return {"trace_id": target, "root_service": "", "status": "not_found", "spans": []}
 
 
 def _deployment(state: dict, namespace: str, name: str) -> dict:
@@ -166,8 +285,14 @@ def _metric_value(dep: dict, wants_restarts: bool) -> int:
     return 268435456 if not dep["healthy"] else 134217728
 
 
-def _doc(timestamp: str, service: str, level: str, message: str) -> dict:
-    return {"@timestamp": timestamp, "service": service, "level": level, "message": message}
+def _doc(timestamp: str, service: str, level: str, message: str, trace_id: str) -> dict:
+    return {
+        "@timestamp": timestamp,
+        "service": service,
+        "level": level,
+        "message": message,
+        "trace_id": trace_id,
+    }
 
 
 def _haystack(doc: dict) -> str:

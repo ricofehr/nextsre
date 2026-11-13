@@ -17,6 +17,10 @@ dependencies = [
     "a2a-sdk[http-server]==1.3.0",
     "mcp==2.3.0",
     "google-adk[a2a,mcp,openai]==2.14.0",
+    "opentelemetry-api==1.45.2",
+    "opentelemetry-sdk==1.45.2",
+    "opentelemetry-exporter-otlp-proto-grpc==1.45.2",
+    "opentelemetry-exporter-otlp-proto-http==1.45.2",
     "uvicorn[standard]==0.54.0",
     "starlette==1.10.0",
     "httpx==0.28.1",
@@ -26,7 +30,6 @@ dependencies = [
 # Real backends - only needed when DEMO_MODE=0.
 real = [
     "kubernetes>=37,<38",
-    "elasticsearch>=8.19,<10",
 ]
 dev = [
     "pytest>=9.2",

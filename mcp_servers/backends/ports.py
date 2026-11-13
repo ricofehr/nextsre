@@ -38,3 +38,16 @@ class AlertsPort(Protocol):
 
 class LogsPort(Protocol):
     def search(self, query: str, service: str | None, minutes: int, size: int) -> list[dict]: ...
+
+
+class TracesPort(Protocol):
+    def search_traces(
+        self,
+        service: str | None,
+        min_duration_ms: int,
+        status: str | None,
+        minutes: int,
+        limit: int,
+    ) -> list[dict]: ...
+
+    def get_trace(self, trace_id: str) -> dict: ...

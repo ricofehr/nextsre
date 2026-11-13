@@ -1,7 +1,7 @@
 """Fail-closed environment parsing.
 
 ``DEMO_MODE`` decides whether the MCP servers talk to synthetic state or to real
-Kubernetes/Prometheus/Elasticsearch and run real subprocesses. A comparison like
+Kubernetes/Prometheus/Loki/Tempo and run real subprocesses. A comparison like
 ``os.environ.get("DEMO_MODE", "1") == "1"`` treats every value it does not
 recognise - ``true``, ``yes``, a stray space - as "not demo", which silently arms
 the real backends. That is the wrong direction to fail in, so ``env_flag``

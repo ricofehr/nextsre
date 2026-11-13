@@ -1,4 +1,4 @@
-# Seven services: three read-only MCP servers, two write MCP servers, and the
+# Eight services: four read-only MCP servers, two write MCP servers, and the
 # two A2A agents. A shared volume gives the MCP servers a common "cluster" so
 # the Operator's restart is visible to the Observer's re-read.
 #
@@ -22,6 +22,9 @@ x-demo-env: &demo-env
   # Containers need to accept connections from their compose-network peers.
   # The code defaults to 127.0.0.1; binding wider is deliberate and lives here.
   MCP_BIND_HOST: 0.0.0.0
+  # Optional OpenTelemetry OTLP export (no-op when empty).
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-}
 
 x-host: &host-gateway
   extra_hosts:
@@ -50,11 +53,18 @@ services:
     environment: { <<: *demo-env, PORT: "8102" }
     volumes: [ "cluster-state:/data" ]
 
-  es-logs:
+  loki-logs:
     build: .
     <<: *hardening
-    command: python -m mcp_servers.es_logs
+    command: python -m mcp_servers.loki_logs
     environment: { <<: *demo-env, PORT: "8103" }
+    volumes: [ "cluster-state:/data" ]
+
+  tempo-traces:
+    build: .
+    <<: *hardening
+    command: python -m mcp_servers.tempo_traces
+    environment: { <<: *demo-env, PORT: "8104" }
     volumes: [ "cluster-state:/data" ]
 
   # ---- write MCP servers (Operator's tools) ----
@@ -103,9 +113,10 @@ services:
       OPERATOR_URL: http://operator:9301
       K8S_RO_URL: http://k8s-ro:8101/mcp
       PROMETHEUS_ALERTS_URL: http://prometheus-alerts:8102/mcp
-      ES_LOGS_URL: http://es-logs:8103/mcp
+      LOKI_LOGS_URL: http://loki-logs:8103/mcp
+      TEMPO_TRACES_URL: http://tempo-traces:8104/mcp
     ports: [ "9300:9300" ]
-    depends_on: [ k8s-ro, prometheus-alerts, es-logs, operator ]
+    depends_on: [ k8s-ro, prometheus-alerts, loki-logs, tempo-traces, operator ]
 
 volumes:
   cluster-state:

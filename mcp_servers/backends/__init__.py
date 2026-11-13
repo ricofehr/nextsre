@@ -5,7 +5,7 @@ import time, so reading ``DEMO_MODE`` there would freeze the choice before a tes
 (or a container entrypoint) had a chance to set the environment - and would make
 the servers importable only under the right env.
 
-All eight adapters are stateless (no fields, no held connections), so there is
+All ten adapters are stateless (no fields, no held connections), so there is
 nothing to cache and no lifecycle to manage. Tests override a selector with
 ``monkeypatch.setattr(backends, "k8s_read", ...)``.
 """
@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from common.env import env_flag
 
-from .demo import DemoAlerts, DemoK8sRead, DemoK8sWrite, DemoLogs
-from .ports import AlertsPort, K8sReadPort, K8sWritePort, LogsPort
-from .real import RealAlerts, RealK8sRead, RealK8sWrite, RealLogs
+from .demo import DemoAlerts, DemoK8sRead, DemoK8sWrite, DemoLogs, DemoTraces
+from .ports import AlertsPort, K8sReadPort, K8sWritePort, LogsPort, TracesPort
+from .real import RealAlerts, RealK8sRead, RealK8sWrite, RealLogs, RealTraces
 
 
 def _demo() -> bool:
@@ -37,3 +37,7 @@ def alerts() -> AlertsPort:
 
 def logs() -> LogsPort:
     return DemoLogs() if _demo() else RealLogs()
+
+
+def traces() -> TracesPort:
+    return DemoTraces() if _demo() else RealTraces()
