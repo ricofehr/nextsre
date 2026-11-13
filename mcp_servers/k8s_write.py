@@ -20,19 +20,14 @@ from __future__ import annotations
 import datetime
 import re
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from common.env import env_csv, env_flag, env_int
 from common.serving import bind_host, port, transport_security
 
 from . import backends
 
-mcp = FastMCP(
-    "k8s-write",
-    host=bind_host(),
-    port=port(default=8201),
-    transport_security=transport_security("k8s-write"),
-)
+mcp = MCPServer("k8s-write")
 
 # ---- harness configuration -------------------------------------------------
 PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "default"}
@@ -104,4 +99,9 @@ def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=bind_host(),
+        port=port(default=8201),
+        transport_security=transport_security("k8s-write"),
+    )

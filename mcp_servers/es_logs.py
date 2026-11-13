@@ -7,19 +7,14 @@ here because they are policy: ``size`` and ``minutes`` arrive from an LLM.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from common.env import env_flag
 from common.serving import bind_host, port, transport_security
 
 from . import backends
 
-mcp = FastMCP(
-    "es-logs",
-    host=bind_host(),
-    port=port(default=8103),
-    transport_security=transport_security("es-logs"),
-)
+mcp = MCPServer("es-logs")
 
 MAX_SIZE = 200
 MAX_MINUTES = 1440
@@ -52,4 +47,9 @@ def _clamp(value: int, ceiling: int) -> int:
 
 if __name__ == "__main__":
     env_flag("DEMO_MODE", default=True)  # fail fast on a malformed value
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=bind_host(),
+        port=port(default=8103),
+        transport_security=transport_security("es-logs"),
+    )

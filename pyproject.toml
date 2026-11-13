@@ -11,11 +11,11 @@ requires-python = ">=3.12"
 # Pinned to the exact versions this repo was built and smoke-tested against.
 # A2A 1.x is proto-based and changed substantially from 0.x, so do not float it.
 #
-# mcp stays on 1.x: 2.x renames FastMCP to MCPServer. 1.30.0 clears
-# PYSEC-2026-3483 and CVE-2026-59951 / CVE-2026-116684..116686.
+# mcp 2.x renames FastMCP to MCPServer and moves network binding parameters
+# to run(). Pinned to 2.3.0 (latest 2.x release).
 dependencies = [
     "a2a-sdk[http-server]==1.3.0",
-    "mcp==1.30.0",
+    "mcp==2.3.0",
     "google-adk[a2a,mcp,openai]==2.14.0",
     "uvicorn[standard]==0.54.0",
     "starlette==1.10.0",

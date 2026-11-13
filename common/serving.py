@@ -45,7 +45,7 @@ def allowed_hosts(service: str | None = None) -> list[str]:
 def transport_security(service: str) -> TransportSecuritySettings:
     """Host/Origin validation for a streamable-http MCP server.
 
-    FastMCP passes ``transport_security=None`` straight to
+    MCPServer passes ``transport_security=None`` straight to
     ``TransportSecurityMiddleware``, which reads None as
     ``enable_dns_rebinding_protection=False`` "for backwards compatibility" -
     the inverse of ``TransportSecuritySettings``' own default. Leaving it unset
