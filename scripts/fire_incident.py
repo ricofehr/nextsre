@@ -16,6 +16,7 @@ import os
 import sys
 
 from agents.a2a_app import call_agent
+from common.notifications import emit_incident_milestone
 
 DEFAULT_OBSERVER_URL = "http://localhost:9300"
 DEFAULT_PROMPT = "Investigate the active incident and remediate it if it is safe to do so."
@@ -46,11 +47,27 @@ async def main() -> None:
             print(f"• could not reset demo state ({exc}); the servers keep their own\n")
 
     print(f"→ sending to Observer: {prompt}\n")
+    await emit_incident_milestone(
+        incident_id="incident-seed",
+        phase="triage",
+        title="Incident investigation started",
+        summary=prompt,
+        service="payments-api",
+        namespace="payments",
+    )
 
     def on_status(s: str) -> None:
         print(f"   {s}")
 
     report = await call_agent(observer_url, prompt, on_status=on_status)
+    await emit_incident_milestone(
+        incident_id="incident-seed",
+        phase="resolved",
+        title="Incident investigation completed",
+        summary="Report emitted by Observer",
+        service="payments-api",
+        namespace="payments",
+    )
     print("\n================ INCIDENT REPORT ================\n")
     print(report)
 

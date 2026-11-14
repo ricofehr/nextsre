@@ -369,3 +369,40 @@ NextSRE uses `google-adk[a2a,mcp,openai]` across all three agent layers:
 2. **A2A server execution (`agents/a2a_app.py`)**: `ADKExecutor` wraps ADK's `A2aAgentExecutor` and `InMemoryRunner` with single-flight lazy initialization (`asyncio.Lock`) and sanitized error reporting, served behind Starlette's `TrustedHostMiddleware`.
 3. **MCP toolsets & confirmation gate (`agents/observer/`, `agents/operator/`)**: Tools are loaded via `McpToolset(connection_params=StreamableHTTPConnectionParams(url=...))`. When `REQUIRE_APPROVAL=1`, the Operator passes `require_confirmation=True` to its MCP toolsets so ADK pauses before executing any write tool.
 4. **Framework-independent MCP servers (`mcp_servers/`)**: The six MCP servers, demo state (`demo_state.py`), `docker-compose.yml` topology, OpenTelemetry instrumentation (`common/telemetry.py`), and three-layer harness remain completely decoupled from the agent framework.
+
+---
+
+## Production SRE Agent Innovations
+
+### Ingestion Gateway (`services/gateway.py`)
+
+A lightweight Starlette service listening on port 9302:
+- `POST /api/v1/alerts`: Ingests Prometheus Alertmanager webhook v4 payloads, parses firing alerts, formats a comprehensive diagnosis prompt, and dispatches an asynchronous A2A task to the Observer.
+- **Alert Deduplication (`AlertDeduplicator`)**: Uses an in-memory TTL cache (default 300s window) indexed by alert fingerprint to prevent duplicate concurrent agent runs from alert storms or repeated webhook retries.
+- `POST /api/v1/approval`: Interactive callback handler for Slack Block Kit or external webhooks, resolving pending `ApprovalRequest` tokens.
+
+### Typed Contracts & Quarantine Guardrails (`common/schemas.py`, `common/quarantine.py`)
+
+- **Typed Remediation (`RemediationProposal`)**: Replaces free-text action delegation with validated Pydantic models requiring `action_type`, `target_resource`, `target_namespace`, `reason`, and a pre-computed `RollbackAction`.
+- **Telemetry Quarantine**: Pod logs, traces, and events are sanitized (ANSI escape codes stripped, closing XML tags escaped) and wrapped inside `<telemetry_data source="..." untrusted="true">` to prevent indirect prompt injection from influencing agent decisions.
+
+### Stateful Mutation Circuit Breaker (`common/circuit_breaker.py`)
+
+In-memory anti-flapping and blast radius guardrail integrated into `k8s_write.py`:
+- **Cooldown Window**: Rejects mutations if the same resource was mutated within `REMEDIATION_COOLDOWN_SECONDS` (default 300s) to prevent rapid restart/scale oscillations.
+- **Incident Budget Ceiling**: Enforces `MAX_INCIDENT_MUTATIONS` (default 5 operations per session), halting autonomous changes and escalating to humans when exceeded.
+
+### ChatOps Notifications & Interactive Approvals (`common/notifications/`, `common/approval.py`)
+
+- **Progressive Milestones**: Emits structured `IncidentCard` events across incident phases: `triage`, `hypothesis`, `remediation_proposed`, `action_executing`, `verification`, `resolved`, and `failed`.
+- **Slack Block Kit**: Renders rich cards with service/namespace metadata and interactive "Approve Remediation" / "Deny" action buttons.
+- **Interactive Gate**: When `REQUIRE_APPROVAL=1`, pending mutations register an `ApprovalRequest` token with `approval_store.wait()` and unblock only when an authorized callback arrives.
+
+### OpenTelemetry GenAI Semantic Conventions (`common/telemetry.py`)
+
+Instrumented agent spans and traces record:
+- `gen_ai.system`: `"adk"`
+- `gen_ai.agent.name`: `"observer"` / `"operator"`
+- `gen_ai.request.model`: e.g. `gemma3:27b`
+- `gen_ai.operation.name`: `"investigate"`, `"triage"`, `"remediate"`
+- Span events for incident milestones: `incident.milestone.<phase>` on the active trace.

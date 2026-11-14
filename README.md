@@ -40,6 +40,11 @@ headers for end-to-end OpenTelemetry tracing.
 | `mcp_servers/tempo_traces.py` | search Grafana Tempo traces (`search_traces`) and inspect trace spans (`get_trace`) |
 | `mcp_servers/k8s_write.py` | restart/scale deployments — **harness: namespace allowlist + replica cap + name validation** |
 | `mcp_servers/shell_exec.py` | run host commands — **harness: binary allowlist + per-binary non-destructive verb allowlist + token denylist** |
+| `services/gateway.py` | Alertmanager webhook receiver (`:9302`), alert deduplication, and approval callback handler |
+| `common/schemas.py` | strongly typed Pydantic contracts: `RemediationProposal`, `RollbackAction`, `AlertmanagerPayload` |
+| `common/circuit_breaker.py` | anti-flapping sliding cooldowns and incident mutation budget ceilings |
+| `common/quarantine.py` | untrusted telemetry sanitization and delimitation against prompt injection |
+| `common/notifications/` | progressive incident cards (Slack Block Kit / JSON webhooks) and interactive approvals |
 | `mcp_servers/backends/` | demo vs real adapters behind a port per domain; selection is lazy, so the tools stay importable and testable |
 | `mcp_servers/demo_state.py` | shared synthetic "cluster" so the demo runs without real infra |
 | `common/env.py` | fail-closed env parsing — an unrecognised `DEMO_MODE` raises instead of quietly meaning "not demo" |
@@ -90,15 +95,28 @@ Eight containers start: six MCP servers plus the two agents. Only the Observer
 is published, on `localhost:9300`; everything else is reachable on the compose
 network only (see [Network boundary](#network-boundary)).
 
-### 3. Fire the seed incident
+### 3. Fire an incident
 
-From the host (in the repo, with deps installed) or inside a container:
+From the host (in the repo, with deps installed) or via Alertmanager webhook:
 
 ```bash
-pip install .                          # or: pip install -e .
+# Option A: Trigger via CLI script
 python -m scripts.fire_incident
-# or a custom prompt:
-python -m scripts.fire_incident "why are payments-api pods crashing?"
+
+# Option B: Send Prometheus Alertmanager webhook payload to gateway (port 9302)
+curl -X POST http://localhost:9302/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"status":"firing","alerts":[{"status":"firing","labels":{"alertname":"PodCrashLooping","service":"payments-api","namespace":"payments","severity":"critical"},"annotations":{"summary":"payments-api crashing"},"fingerprint":"abc123"}]}'
+```
+
+### 4. Notifications & Safeguards Configuration
+
+Configure Slack notifications and mutation guardrails in `.env`:
+
+```bash
+SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."   # Slack Block Kit status cards
+REMEDIATION_COOLDOWN_SECONDS="300"                         # Anti-flapping cooldown per workload
+MAX_INCIDENT_MUTATIONS="5"                                 # Maximum mutations per incident session
 ```
 
 ## Tests and linting

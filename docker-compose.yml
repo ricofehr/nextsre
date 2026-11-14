@@ -118,5 +118,16 @@ services:
     ports: [ "9300:9300" ]
     depends_on: [ k8s-ro, prometheus-alerts, loki-logs, tempo-traces, operator ]
 
+  gateway:
+    build: .
+    command: python -m services.gateway
+    <<: [ *host-gateway, *hardening ]
+    environment:
+      <<: [ *demo-env ]
+      PORT: "9302"
+      OBSERVER_URL: http://observer:9300
+    ports: [ "9302:9302" ]
+    depends_on: [ observer ]
+
 volumes:
   cluster-state:

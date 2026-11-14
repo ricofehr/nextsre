@@ -13,6 +13,7 @@ import httpx
 import pytest
 import uvicorn
 
+from common.circuit_breaker import circuit_breaker
 from mcp_servers import (
     backends,
     demo_state,
@@ -88,6 +89,7 @@ def test_restart_resolves_the_incident():
 
 def test_scale_updates_shared_state():
     k8s_write.restart_deployment("web", "web")
+    circuit_breaker.reset()
     k8s_write.scale_deployment("web", "web", 6)
     assert len(k8s_readonly.list_pods("web")) == 6
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from common.circuit_breaker import circuit_breaker
 from mcp_servers import demo_state
 
 
@@ -16,4 +17,5 @@ from mcp_servers import demo_state
 def demo_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("DEMO_STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setenv("DEMO_MODE", "1")
+    circuit_breaker.reset()
     demo_state.reset()

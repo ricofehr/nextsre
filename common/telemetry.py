@@ -188,3 +188,37 @@ def traced_tool(fn: F) -> F:
             return result
 
     return _sync_wrapper  # type: ignore[return-value]
+
+
+def record_genai_attributes(
+    span: trace.Span,
+    agent_name: str,
+    operation_name: str,
+    model: str | None = None,
+    system: str = "adk",
+) -> None:
+    """Record GenAI semantic convention attributes onto an active OpenTelemetry span."""
+    if not span.is_recording():
+        return
+    span.set_attribute("gen_ai.system", system)
+    span.set_attribute("gen_ai.agent.name", agent_name)
+    span.set_attribute("gen_ai.operation.name", operation_name)
+    resolved_model = model or os.environ.get("LLM_MODEL", "local")
+    span.set_attribute("gen_ai.request.model", resolved_model)
+
+
+def record_incident_milestone_event(
+    phase: str,
+    summary: str,
+    attributes: Mapping[str, Any] | None = None,
+) -> None:
+    """Record an incident milestone event onto the current active span if recording."""
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+    event_attrs: dict[str, Any] = {"phase": phase, "summary": summary}
+    if attributes:
+        for k, v in attributes.items():
+            if isinstance(v, (str, int, float, bool)):
+                event_attrs[k] = v
+    span.add_event(f"incident.milestone.{phase}", attributes=event_attrs)
