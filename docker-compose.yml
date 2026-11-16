@@ -1,15 +1,17 @@
-# Eight services: four read-only MCP servers, two write MCP servers, and the
-# two A2A agents. A shared volume gives the MCP servers a common "cluster" so
-# the Operator's restart is visible to the Observer's re-read.
+# Nine services: four read-only MCP servers, two write MCP servers, the two A2A
+# agents, and the Alertmanager ingestion gateway. A shared volume gives the MCP
+# servers a common "cluster" so the Operator's restart is visible to the
+# Observer's re-read.
 #
 # The local LLM is expected on the host (Ollama / llama-server). Containers
 # reach it via host.docker.internal (see extra_hosts). Override LLM_* in .env.
 #
-# Only the Observer publishes a port. The MCP servers and the Operator are
-# reachable on the compose network only: none of them authenticates its caller,
-# so anything that can open a socket to shell-exec:8202 gets command execution,
-# and anything that can reach operator:9301 can drive the write agent directly
-# without the Observer ever being involved.
+# Only the Observer (9300) and the gateway (9302) publish a port. The MCP
+# servers and the Operator are reachable on the compose network only: none of
+# them authenticates its caller, so anything that can open a socket to
+# shell-exec:8202 gets command execution, and anything that can reach
+# operator:9301 can drive the write agent directly without the Observer ever
+# being involved.
 
 x-llm-env: &llm-env
   LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
@@ -111,6 +113,8 @@ services:
       PORT: "9300"
       OBSERVER_PUBLIC_URL: http://observer:9300
       OPERATOR_URL: http://operator:9301
+      OBSERVE_ONLY: ${OBSERVE_ONLY:-0}
+      OPERATOR_TIMEOUT_S: ${OPERATOR_TIMEOUT_S:-120}
       K8S_RO_URL: http://k8s-ro:8101/mcp
       PROMETHEUS_ALERTS_URL: http://prometheus-alerts:8102/mcp
       LOKI_LOGS_URL: http://loki-logs:8103/mcp
@@ -126,6 +130,8 @@ services:
       <<: [ *demo-env ]
       PORT: "9302"
       OBSERVER_URL: http://observer:9300
+      WEBHOOK_AUTH_TOKEN: ${WEBHOOK_AUTH_TOKEN:-}
+      OBSERVER_TIMEOUT_S: ${OBSERVER_TIMEOUT_S:-180}
     ports: [ "9302:9302" ]
     depends_on: [ observer ]
 

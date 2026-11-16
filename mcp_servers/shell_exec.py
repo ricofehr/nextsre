@@ -9,7 +9,9 @@ binary allowlist itself. Mutating Kubernetes actions must go through
 
 Rules, all enforced before anything runs:
 
-* binary allowlist - only vetted binaries, and never path-qualified
+* binary allowlist - only vetted binaries, and never path-qualified. A
+  deployment can narrow it with ``SHELL_BINARIES`` (in a pod, ``df`` or
+  ``systemctl`` would describe the container, not a host) but never widen it
 * verb at a fixed position - for binaries that take a subcommand, ``argv[1]``
   must be the verb and must not be a flag. Scanning for "the first non-flag
   token" instead is unsafe: kubectl global flags take values, so
@@ -35,7 +37,7 @@ import subprocess
 
 from mcp.server.mcpserver import MCPServer
 
-from common.env import env_flag
+from common.env import env_csv, env_flag
 from common.serving import bind_host, port, transport_security
 from common.telemetry import init_telemetry, traced_tool
 
@@ -102,7 +104,8 @@ DENIED_TOKENS = {
     "--kustomize",
     # kubectl identity and endpoint redirection: --as escalates through the
     # Operator's own RBAC, --server/--kubeconfig point it at an attacker's
-    # cluster and hand over the bearer token
+    # cluster and hand over the bearer token (the -s alias of --server is
+    # checked separately, see _kubectl_server_override)
     "--as",
     "--as-group",
     "--as-uid",
@@ -285,6 +288,25 @@ def _fragments(token: str) -> list[str]:
     return result
 
 
+# kubectl's short alias for --server. Not in DENIED_TOKENS: ``ss -s`` and
+# ``uptime -s`` are benign. pflag reads a shorthand cluster left to right until a
+# shorthand that takes a value, which consumes the rest (or the next argument), so
+# ``-As URL`` and ``-shttp://x`` are both --server while ``-nkube-system`` is not.
+_KUBECTL_SERVER_SHORTHAND = "s"
+_KUBECTL_VALUE_SHORTHANDS = set("noLlcfkv")
+
+
+def _kubectl_server_override(token: str) -> bool:
+    if token.startswith("--") or not token.startswith("-"):
+        return False
+    for char in token[1:]:
+        if char == _KUBECTL_SERVER_SHORTHAND:
+            return True
+        if char in _KUBECTL_VALUE_SHORTHANDS:
+            return False
+    return False
+
+
 def _is_short_flag(fragment: str) -> bool:
     return fragment.startswith("-") and not fragment.startswith("--")
 
@@ -329,6 +351,17 @@ def _guard_flags(binary: str, argv: list[str]) -> None:
                 )
 
 
+def _allowed_binaries() -> set[str]:
+    """The built-in allowlist, intersected with ``SHELL_BINARIES`` when set.
+
+    Read at call time like the namespace allowlist. An intersection that comes
+    out empty refuses everything rather than falling back to the full list.
+    """
+    if os.environ.get("SHELL_BINARIES") is None:
+        return set(ALLOWED_BINARIES)
+    return ALLOWED_BINARIES & env_csv("SHELL_BINARIES", default="")
+
+
 def _harness_check(command: str) -> list[str]:
     """Raise if the command violates policy; else return the argv to execute."""
     argv = shlex.split(command)
@@ -338,12 +371,15 @@ def _harness_check(command: str) -> list[str]:
     binary = argv[0]
     if "/" in binary:
         raise PermissionError("binaries must be named, not path-qualified")
-    if binary not in ALLOWED_BINARIES:
+    allowed_binaries = _allowed_binaries()
+    if binary not in allowed_binaries:
         raise PermissionError(
-            f"binary '{binary}' is not on the allowlist {sorted(ALLOWED_BINARIES)}"
+            f"binary '{binary}' is not on the allowlist {sorted(allowed_binaries)}"
         )
 
     denied = [token for token in argv if _denied(token)]
+    if binary == "kubectl":
+        denied += [token for token in argv if _kubectl_server_override(token)]
     if denied:
         raise PermissionError(f"command contains denied token(s): {denied}")
 

@@ -141,6 +141,40 @@ def test_allowed_commands(command):
     assert shell_exec._harness_check(command)[0] in shell_exec.ALLOWED_BINARIES
 
 
+@pytest.mark.parametrize("command", ["df -h", "systemctl status nginx", "uptime"])
+def test_shell_binaries_narrowed_to_kubectl_refuses_host_tools(monkeypatch, command):
+    monkeypatch.setenv("SHELL_BINARIES", "kubectl")
+    with pytest.raises(PermissionError, match="not on the allowlist"):
+        shell_exec._harness_check(command)
+
+
+def test_shell_binaries_narrowed_kubectl_keeps_verb_policy(monkeypatch):
+    monkeypatch.setenv("SHELL_BINARIES", "kubectl")
+    assert shell_exec._harness_check("kubectl get pods -n web")[0] == "kubectl"
+    with pytest.raises(PermissionError):
+        shell_exec._harness_check("kubectl delete pod x -n web")
+
+
+@pytest.mark.parametrize("command", ["bash -c id", "curl http://example.com"])
+def test_shell_binaries_cannot_widen_allowlist(monkeypatch, command):
+    monkeypatch.setenv("SHELL_BINARIES", "kubectl, bash ,curl")
+    with pytest.raises(PermissionError, match=r"allowlist \['kubectl'\]"):
+        shell_exec._harness_check(command)
+
+
+@pytest.mark.parametrize("value", ["bash", ",", ""])
+def test_shell_binaries_empty_intersection_refuses_everything(monkeypatch, value):
+    monkeypatch.setenv("SHELL_BINARIES", value)
+    for command in ("uptime", "kubectl get pods"):
+        with pytest.raises(PermissionError, match=r"allowlist \[\]"):
+            shell_exec._harness_check(command)
+
+
+def test_shell_binaries_unset_keeps_builtin_allowlist(monkeypatch):
+    monkeypatch.delenv("SHELL_BINARIES", raising=False)
+    assert shell_exec._harness_check("uptime") == ["uptime"]
+
+
 def test_empty_command_refused():
     with pytest.raises(ValueError):
         shell_exec._harness_check("   ")
@@ -344,3 +378,34 @@ def test_telemetry_rejects_invalid_protocol_and_endpoint_scheme(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "websocket")
     with pytest.raises(ValueError, match="OTEL_EXPORTER_OTLP_PROTOCOL"):
         telemetry.init_telemetry("observer")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "kubectl get pods -s http://192.0.2.10:80",
+        "kubectl get pods -shttp://192.0.2.10:80",
+        "kubectl get pods -As http://192.0.2.10:80",
+        "kubectl get pods -wAs http://192.0.2.10:80",
+        "kubectl -s http://192.0.2.10 get pods",
+    ],
+)
+def test_kubectl_server_shorthand_refused(command):
+    with pytest.raises(PermissionError):
+        shell_exec._harness_check(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "kubectl get pods -n kube-system-sidecars",
+        "kubectl get pods -nstaging",
+        "kubectl get pods -oyaml -n web",
+        "kubectl get pods -A",
+        "kubectl get pods -l app=sso",
+        "ss -s",
+        "uptime -s",
+    ],
+)
+def test_benign_s_shorthands_still_allowed(command):
+    assert shell_exec._harness_check(command)

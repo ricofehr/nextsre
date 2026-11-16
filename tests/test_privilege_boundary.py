@@ -87,3 +87,79 @@ def test_operator_require_approval_enables_toolset_confirmation(monkeypatch):
     assert op_default.tools and all(
         getattr(t, "require_confirmation", False) is False for t in op_default.tools
     )
+
+
+def _built_observer_tool_names(monkeypatch, value):
+    import asyncio
+
+    if value is None:
+        monkeypatch.delenv("OBSERVE_ONLY", raising=False)
+    else:
+        monkeypatch.setenv("OBSERVE_ONLY", value)
+    observer = asyncio.run(observer_agent.build_observer())
+    return [getattr(t, "name", type(t).__name__) for t in observer.tools], observer.instruction
+
+
+def test_observe_only_drops_the_remediation_bridge(monkeypatch):
+    names, instruction = _built_observer_tool_names(monkeypatch, "1")
+    assert "request_remediation" not in names
+    assert names == ["McpToolset"] * 4, names
+    assert instruction == observer_agent.SYSTEM_OBSERVE_ONLY
+    assert "recommended remediation" in instruction
+    assert "request_remediation" not in instruction
+
+
+def test_observe_only_unset_or_false_keeps_the_remediation_bridge(monkeypatch):
+    for value in (None, "0"):
+        names, instruction = _built_observer_tool_names(monkeypatch, value)
+        assert "request_remediation" in names
+        assert instruction == observer_agent.SYSTEM
+
+
+def test_observe_only_malformed_value_refuses_to_build(monkeypatch):
+    import pytest
+
+    with pytest.raises(ValueError, match="OBSERVE_ONLY"):
+        _built_observer_tool_names(monkeypatch, "maybe")
+
+
+def test_observer_server_refuses_to_start_on_malformed_observe_only():
+    """The agent is built lazily, so the server itself must validate the flag."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "OBSERVE_ONLY": "maybe", "PORT": "0"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "agents.observer.server"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode != 0
+    assert "OBSERVE_ONLY" in proc.stderr
+
+
+def test_operator_timeout_is_configurable(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.observer import remediation_tool
+
+    proposal = (
+        '{"action_type":"restart","target_resource":"web","target_namespace":"web",'
+        '"reason":"crash loop","rollback_action":{"action_type":"restart",'
+        '"target_resource":"web","target_namespace":"web","description":"re-restart"}}'
+    )
+    call_agent = AsyncMock(return_value="done")
+    monkeypatch.setattr(remediation_tool, "call_agent", call_agent)
+    monkeypatch.setattr(remediation_tool, "emit_incident_milestone", AsyncMock())
+
+    monkeypatch.delenv("OPERATOR_TIMEOUT_S", raising=False)
+    asyncio.run(remediation_tool._request_remediation(proposal))
+    assert call_agent.await_args.kwargs["timeout"] == 120
+
+    monkeypatch.setenv("OPERATOR_TIMEOUT_S", "600")
+    asyncio.run(remediation_tool._request_remediation(proposal))
+    assert call_agent.await_args.kwargs["timeout"] == 600
