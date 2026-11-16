@@ -19,7 +19,9 @@ from agents.a2a_app import call_agent
 from common.notifications import emit_incident_milestone
 
 DEFAULT_OBSERVER_URL = "http://localhost:9300"
-DEFAULT_PROMPT = "Investigate the active incident and remediate it if it is safe to do so."
+# Remediation-neutral, like the gateway's: the Observer's own prompt decides whether
+# to delegate a fix or only recommend one (OBSERVE_ONLY).
+DEFAULT_PROMPT = "Investigate the active incident and diagnose its root cause."
 
 
 async def main() -> None:

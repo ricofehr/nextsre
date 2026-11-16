@@ -17,17 +17,22 @@ from google.adk.tools import FunctionTool
 from pydantic import ValidationError
 
 from agents.a2a_app import call_agent
+from common.env import env_int
 from common.notifications import emit_incident_milestone
 from common.schemas import RemediationProposal
 
 log = logging.getLogger("remediation_tool")
 
 DEFAULT_OPERATOR_URL = "http://localhost:9301"
-OPERATOR_TIMEOUT_S = 120.0
+DEFAULT_OPERATOR_TIMEOUT_S = 120
 
 
 def _operator_url() -> str:
     return os.environ.get("OPERATOR_URL", DEFAULT_OPERATOR_URL)
+
+
+def operator_timeout() -> int:
+    return env_int("OPERATOR_TIMEOUT_S", default=DEFAULT_OPERATOR_TIMEOUT_S)
 
 
 def validate_remediation_payload(raw_payload: str | dict[str, Any]) -> RemediationProposal:
@@ -73,11 +78,12 @@ async def _request_remediation(action: str) -> str:
         details={"rollback_action": proposal.rollback_action.model_dump()},
     )
 
-    # A smaller budget than the caller's own: this hop is nested inside the
-    # Observer's task, and with equal timeouts the outer one always fires first,
-    # surfacing a slow-but-successful remediation as a client timeout.
+    # Keep this below the caller's own budget (OBSERVER_TIMEOUT_S at the gateway):
+    # this hop is nested inside the Observer's task, and with equal timeouts the
+    # outer one always fires first, surfacing a slow-but-successful remediation
+    # as a client timeout.
     serialized = proposal.model_dump_json()
-    result = await call_agent(_operator_url(), serialized, timeout=OPERATOR_TIMEOUT_S)
+    result = await call_agent(_operator_url(), serialized, timeout=operator_timeout())
 
     await emit_incident_milestone(
         incident_id="incident",

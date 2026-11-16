@@ -13,6 +13,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
@@ -84,6 +85,11 @@ class ConsoleNotifier(BaseNotifier):
         return True
 
 
+def _endpoint_for_log(url: str) -> str:
+    """Host only: webhook URLs (Slack's included) carry their secret in the path."""
+    return urlsplit(url).hostname or "<invalid url>"
+
+
 class WebhookNotifier(BaseNotifier):
     """Dispatches raw JSON incident cards to an HTTP webhook."""
 
@@ -98,8 +104,37 @@ class WebhookNotifier(BaseNotifier):
                 res = await client.post(self.webhook_url, json=card.model_dump())
                 return res.status_code in (200, 201, 202, 204)
         except Exception as exc:
-            log.warning("Failed to send webhook notification to %s: %s", self.webhook_url, exc)
+            # The exception type only: httpx messages can embed the full URL.
+            log.warning(
+                "Failed to send webhook notification to %s: %s",
+                _endpoint_for_log(self.webhook_url),
+                type(exc).__name__,
+            )
             return False
+
+
+_SLACK_SECTION_TEXT_LIMIT = 3000
+_SUMMARY_PREFIX = "*Summary:*\n"
+
+
+def _slack_escape(text: str) -> str:
+    """Neutralise Slack mrkdwn control sequences in untrusted text.
+
+    Summaries carry Observer reports that quote workload logs; unescaped, a
+    logged ``<!channel>`` or ``<https://evil|label>`` becomes a live ping or a
+    disguised link in the incident channel. These three are the characters
+    Slack documents as needing escaping.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _slack_summary(summary: str) -> str:
+    """The escaped summary, truncated to fit one Block Kit section."""
+    budget = _SLACK_SECTION_TEXT_LIMIT - len(_SUMMARY_PREFIX)
+    escaped = _slack_escape(summary)
+    if len(escaped) > budget:
+        escaped = escaped[: budget - 1] + "…"
+    return _SUMMARY_PREFIX + escaped
 
 
 class SlackBlockKitNotifier(BaseNotifier):
@@ -125,18 +160,24 @@ class SlackBlockKitNotifier(BaseNotifier):
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Incident ID:*\n`{card.incident_id}`"},
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Incident ID:*\n`{_slack_escape(card.incident_id)}`",
+                    },
                     {"type": "mrkdwn", "text": f"*Phase:*\n*{card.phase.upper()}*"},
                     {
                         "type": "mrkdwn",
-                        "text": f"*Service:*\n{card.service or 'N/A'} ({card.namespace or 'N/A'})",
+                        "text": (
+                            f"*Service:*\n{_slack_escape(card.service or 'N/A')} "
+                            f"({_slack_escape(card.namespace or 'N/A')})"
+                        ),
                     },
                     {"type": "mrkdwn", "text": f"*Time:*\n{card.timestamp[:19]}Z"},
                 ],
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Summary:*\n{card.summary}"},
+                "text": {"type": "mrkdwn", "text": _slack_summary(card.summary)},
             },
         ]
 
@@ -174,7 +215,11 @@ class SlackBlockKitNotifier(BaseNotifier):
                 res = await client.post(self.slack_webhook_url, json=payload)
                 return res.status_code == 200
         except Exception as exc:
-            log.warning("Failed to post Slack notification: %s", exc)
+            log.warning(
+                "Failed to post Slack notification to %s: %s",
+                _endpoint_for_log(self.slack_webhook_url),
+                type(exc).__name__,
+            )
             return False
 
 

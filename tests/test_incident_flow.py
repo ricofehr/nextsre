@@ -723,3 +723,81 @@ def test_real_tempo_traces_search_and_get_trace(monkeypatch):
     assert detail["status"] == "error"
     assert detail["spans"][0]["attributes"]["k8s.pod.name"] == "payments-api-00"
     assert requests_seen == ["/api/search", f"/api/traces/{trace_id}"]
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_observe_only_observer_completes_without_an_operator(monkeypatch):
+    """An observe-only Observer serves a task end to end and never dials the Operator."""
+    import socket
+
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    from agents.a2a_app import ADKExecutor, build_app, call_agent
+    from agents.observer import observer_agent
+    from agents.observer.card import observer_card
+
+    class ReportLlm(BaseLlm):
+        model: str = "report"
+
+        async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False):
+            yield LlmResponse(
+                content=types.Content(
+                    role="model", parts=[types.Part(text="report: recommend a rolling restart")]
+                )
+            )
+
+    operator_dials: list[object] = []
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(0.2)
+
+    def count_dials():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            operator_dials.append(conn)
+            conn.close()
+
+    threading.Thread(target=count_dials, daemon=True).start()
+
+    port = _free_port()
+    monkeypatch.setenv("OBSERVE_ONLY", "1")
+    monkeypatch.setenv("OPERATOR_URL", f"http://127.0.0.1:{listener.getsockname()[1]}")
+    monkeypatch.setenv("OBSERVER_PUBLIC_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(observer_agent, "_mcp_toolsets", lambda: {})
+    monkeypatch.setattr(observer_agent, "local_llm", lambda: ReportLlm())
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            build_app(
+                observer_card(), ADKExecutor(observer_agent.build_observer), service="observer"
+            ),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    threading.Thread(target=server.run, daemon=True).start()
+    try:
+        _await_card(f"http://127.0.0.1:{port}/.well-known/agent-card.json")
+        report = asyncio.run(call_agent(f"http://127.0.0.1:{port}", "pods are crash looping"))
+        assert report == "report: recommend a rolling restart"
+        assert operator_dials == []
+    finally:
+        server.should_exit = True
+        listener.close()

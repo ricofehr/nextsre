@@ -114,7 +114,9 @@ curl -X POST http://localhost:9302/api/v1/alerts \
 Configure Slack notifications and mutation guardrails in `.env`:
 
 ```bash
-SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."   # Slack Block Kit status cards
+SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."   # Slack Block Kit status cards and investigation reports
+WEBHOOK_AUTH_TOKEN="..."                                   # Bearer token for /api/v1/alerts (mandatory when DEMO_MODE=0)
+OBSERVER_TIMEOUT_S="180"                                   # Upper bound on one Observer investigation
 REMEDIATION_COOLDOWN_SECONDS="300"                         # Anti-flapping cooldown per workload
 MAX_INCIDENT_MUTATIONS="5"                                 # Maximum mutations per incident session
 ```
@@ -236,6 +238,22 @@ agents' and MCP servers' own OpenTelemetry spans to the cluster's
 `OTEL_SERVICE_NAME`. Keep the Operator's service account RBAC-scoped to exactly
 the verbs/namespaces its harness allows — the harness is your second line, RBAC
 is your first.
+
+On a real cluster, start with `OBSERVE_ONLY=1`: the Observer investigates and
+recommends a remediation, and nothing it can call reaches the Operator. Writes are
+enabled later by configuration alone (`OBSERVE_ONLY=0`, the target namespaces in
+`ALLOWED_NAMESPACES`, and matching RoleBindings). **[docs/deploy-kubernetes.md](docs/deploy-kubernetes.md)**
+is the full Kubernetes contract: components, environment, RBAC per service
+account, NetworkPolicies, enabling writes, and a smoke test.
+
+### Container image
+
+CI (`.github/workflows/image.yml`) builds the image on every pull request and
+publishes it to `ghcr.io/ricofehr/nextsre` from `main` and from `v*` tags, tagged
+with the full commit SHA (pin deployments to it), plus `main` or the version. One
+image runs every component, including the `real` extra and a pinned,
+checksum-verified `kubectl` (`KUBECTL_VERSION` build arg; keep it within one minor
+of the cluster).
 
 ## Notes / gotchas
 

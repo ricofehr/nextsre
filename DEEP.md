@@ -61,6 +61,16 @@ The system prompt encodes a fixed workflow:
 
 The phrase _"If (and only if)"_ in the prompt is load-bearing: it tells the LLM to default to no-op, not to remediate speculatively.
 
+### Observe-only mode
+
+`OBSERVE_ONLY=1` (parsed strictly by `env_flag`, read when `build_observer()` runs) builds
+the Observer with the four read toolsets and **without** `request_remediation`. The prompt
+keeps the shared investigation and untrusted-data sections (`INVESTIGATE`) but swaps the
+closing: instead of delegating then verifying (`DELEGATE`), it ends with a recommended
+remediation (action, target, namespace, rollback) for a human, and must never claim an
+action was taken (`RECOMMEND`). No Operator needs to exist. This is the mode to start a
+real cluster in; `OBSERVE_ONLY=0` restores the bridge.
+
 ### The remediation bridge (`agents/observer/remediation_tool.py`)
 
 `request_remediation` is an ADK `FunctionTool` that wraps `call_agent` from `agents/a2a_app.py`. It sends the Observer's `action` string as plain text to the Operator's A2A endpoint and returns the Operator's textual report. From the LLM's perspective it looks like any other tool call; underneath it is a full JSON-RPC round-trip to a separate process.
@@ -68,10 +78,14 @@ The phrase _"If (and only if)"_ in the prompt is load-bearing: it tells the LLM 
 ```python
 async def _request_remediation(action: str) -> str:
     """Delegate ONE precise infrastructure change to the write agent."""
-    return await call_agent(_operator_url(), action, timeout=OPERATOR_TIMEOUT_S)
+    return await call_agent(_operator_url(), action, timeout=operator_timeout())
 
 request_remediation = FunctionTool(_request_remediation)
 ```
+
+`operator_timeout()` reads `OPERATOR_TIMEOUT_S` (default 120 s, httpx's per-read budget);
+the Observer server validates it at startup. Keep it below the gateway's
+`OBSERVER_TIMEOUT_S`, which bounds the whole investigation this call is nested in.
 
 The Observer never sees write MCP tools. Its tool list at runtime is exactly the four MCP toolsets plus this one bridge.
 
@@ -333,10 +347,16 @@ around `k8s_write.py` entirely. `_harness_check(command)` works in five passes o
 `shlex.split` argv — never over the raw string, since quoting and whitespace make
 raw-string matching trivially evadable:
 
-1. `argv[0]` must be in `ALLOWED_BINARIES` and must not be path-qualified.
+1. `argv[0]` must be in `ALLOWED_BINARIES` and must not be path-qualified. When
+   `SHELL_BINARIES` is set (comma-separated, read per call), only binaries in *both*
+   lists pass: a deployment can narrow the allowlist, never widen it, and an empty
+   intersection refuses everything. In a pod, set it to `kubectl` — `df`, `free` or
+   `systemctl` would describe the container, not a host.
 2. No token may match `DENIED_TOKENS` — mutating kubectl subcommands (`delete`, `apply`,
    `exec`, `scale`, …), `secret`/`secrets`, `--raw`, `dump`, `-f`/`-k` (including attached
-   values like `-fhttps://...`), remote/root systemctl flags (`-H`, `-M`, `--root`,
+   values like `-fhttps://...`), kubectl's `-s` alias of `--server` (walked through a
+   shorthand cluster the way pflag does, so `-As URL` is caught and `-nkube-system` is
+   not), remote/root systemctl flags (`-H`, `-M`, `--root`,
    including `-Huser@remote`), and destructive/path journalctl flags (`--vacuum-*`,
    `--rotate`, `-D`, `--directory`, `--file`). Position-independent, with `=value`
    stripped, leading short flags extracted, and resource separators (`/`, `,`, `.`) split.
@@ -377,7 +397,10 @@ NextSRE uses `google-adk[a2a,mcp,openai]` across all three agent layers:
 ### Ingestion Gateway (`services/gateway.py`)
 
 A lightweight Starlette service listening on port 9302:
-- `POST /api/v1/alerts`: Ingests Prometheus Alertmanager webhook v4 payloads, parses firing alerts, formats a comprehensive diagnosis prompt, and dispatches an asynchronous A2A task to the Observer.
+- `POST /api/v1/alerts`: Ingests Prometheus Alertmanager webhook v4 payloads, parses firing alerts, formats a quarantined diagnosis prompt, and dispatches an asynchronous A2A task to the Observer. The prompt asks for investigation and diagnosis only; whether a remediation is requested or merely recommended is the Observer's own prompt's call (see observe-only mode), so the two can never contradict each other.
+- **Webhook authentication**: a bearer token checked against `WEBHOOK_AUTH_TOKEN` (alias `ALERTMANAGER_BEARER_TOKEN`). In demo mode an unset token accepts every webhook; with `DEMO_MODE=0`, `check_startup_config()` refuses to start without one.
+- **Report publication**: when the Observer returns, its report goes out through the notifiers (console, plus Slack / generic webhook when configured) as a `hypothesis` card carrying the first firing alert's service and namespace; a failed or timed-out call goes out as a `failed` card.
+- **Dispatch timeout**: `OBSERVER_TIMEOUT_S` (default 180) bounds each whole Observer call with `asyncio.wait_for` — httpx's own timeout is per read, and a streaming task resets it with every status event. A local model at 15-20 tok/s needs several minutes per investigation; 900 is a sensible value there.
 - **Alert Deduplication (`AlertDeduplicator`)**: Uses an in-memory TTL cache (default 300s window) indexed by alert fingerprint to prevent duplicate concurrent agent runs from alert storms or repeated webhook retries.
 - `POST /api/v1/approval`: Interactive callback handler for Slack Block Kit or external webhooks, resolving pending `ApprovalRequest` tokens.
 
