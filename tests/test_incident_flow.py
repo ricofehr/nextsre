@@ -160,7 +160,11 @@ def test_a2a_round_trip():
         default_output_modes=["text/plain"],
         capabilities=AgentCapabilities(streaming=True),
         supported_interfaces=[
-            AgentInterface(url="http://127.0.0.1:9399", protocol_binding=TransportProtocol.JSONRPC)
+            AgentInterface(
+                url="http://127.0.0.1:9399",
+                protocol_binding=TransportProtocol.JSONRPC,
+                protocol_version="1.0",
+            )
         ],
         skills=[AgentSkill(id="echo", name="Echo", description="echo", tags=["t"])],
     )
@@ -245,7 +249,11 @@ def test_adk_executor_sanitizes_internal_errors():
         default_output_modes=["text/plain"],
         capabilities=AgentCapabilities(streaming=True),
         supported_interfaces=[
-            AgentInterface(url="http://127.0.0.1:9397", protocol_binding=TransportProtocol.JSONRPC)
+            AgentInterface(
+                url="http://127.0.0.1:9397",
+                protocol_binding=TransportProtocol.JSONRPC,
+                protocol_version="1.0",
+            )
         ],
         skills=[AgentSkill(id="fail", name="Fail", description="fail", tags=["t"])],
     )
@@ -506,7 +514,11 @@ def test_a2a_round_trip_propagates_w3c_traceparent():
         default_output_modes=["text/plain"],
         capabilities=AgentCapabilities(streaming=True),
         supported_interfaces=[
-            AgentInterface(url="http://127.0.0.1:9396", protocol_binding=TransportProtocol.JSONRPC)
+            AgentInterface(
+                url="http://127.0.0.1:9396",
+                protocol_binding=TransportProtocol.JSONRPC,
+                protocol_version="1.0",
+            )
         ],
         skills=[AgentSkill(id="echo", name="Echo", description="echo", tags=["t"])],
     )
