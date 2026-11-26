@@ -15,7 +15,13 @@ def observer_card() -> AgentCard:
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],
         capabilities=AgentCapabilities(streaming=True),
-        supported_interfaces=[AgentInterface(url=url, protocol_binding=TransportProtocol.JSONRPC)],
+        supported_interfaces=[
+            AgentInterface(
+                url=url,
+                protocol_binding=TransportProtocol.JSONRPC,
+                protocol_version="1.0",
+            )
+        ],
         skills=[
             AgentSkill(
                 id="investigate",
